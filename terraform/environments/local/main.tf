@@ -21,3 +21,14 @@ provider "helm" {
     config_path = "~/.kube/config"
   }
 }
+
+module "kubernetes" {
+  source = "../../modules/kubernetes"
+}
+
+module "databases" {
+  source    = "../../modules/databases"
+  namespace = module.kubernetes.namespace_data
+
+  depends_on = [module.kubernetes]
+}
