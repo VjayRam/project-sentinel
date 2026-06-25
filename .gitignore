@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+*.onnx
+models/
+data/
+*.parquet
+*.csv
+.DS_Store
