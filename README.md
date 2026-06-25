@@ -1,6 +1,8 @@
 # Sentinel — LLM Content Safety Monitoring Platform
 
-A production-grade platform for real-time toxicity classification, distributed tracing, and automated drift detection on LLM applications. Sentinel consumes OpenTelemetry traces from an external chat application, classifies prompts and responses using an optimized RoBERTa model, detects distribution drift, and triggers automated retraining — all running on Kubernetes with full observability.
+A production-grade **post-delivery monitoring** platform for LLM applications. Sentinel consumes OpenTelemetry traces from an external chat application, classifies prompts and responses using an optimized RoBERTa model, detects statistical distribution drift, and triggers automated retraining — all running on Kubernetes with full observability.
+
+> **Scope:** Sentinel is a monitoring and audit system, not a real-time blocking gateway. Classification happens asynchronously after the chat app has already returned its response. This is an explicit design decision — inserting the classifier into the hot path would add ~35ms to every user-facing request. The tradeoff is accepted in favor of zero impact on user latency.
 
 ---
 
@@ -8,64 +10,65 @@ A production-grade platform for real-time toxicity classification, distributed t
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│  YOUR CHAT APP (external, emits OTel traces via OTLP/gRPC)     │
-│                                                                │
-│  Span attributes:                                              │
-│    llm.request.prompt        — user input text                 │
-│    llm.response.content      — model output text               │
-│    llm.request.model         — which model was called          │
-│    llm.response.latency_ms   — inference time                  │
-│    llm.response.tokens       — token count                     │
-│    session.id                — conversation session            │
+│  YOUR CHAT APP (external, emits OTel traces via OTLP/gRPC)    │
+│  Span attributes: llm.request.prompt, llm.response.content,   │
+│  llm.request.model, llm.response.latency_ms, session.id       │
 └────────────────────┬───────────────────────────────────────────┘
                      │ OTLP/gRPC (:4317)
                      ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                    SENTINEL CLUSTER (K8s)                      │
 │                                                                │
-│  ┌──────────────────┐                                          │
-│  │  OTel Collector  │  Receives traces, fans out to:           │
-│  │  (DaemonSet)     │──┬─▶ Kafka (traces.raw topic)            │
-│  │                  │  ├─▶ Jaeger (trace visualization)        │
-│  │                  │  └─▶ Prometheus (spanmetrics connector)  │
-│  └──────────────────┘                                          │
-│           │                                                    │
-│           ▼                                                    │
-│  ┌───────────────────┐    ┌──────────────────────────────┐    │
-│  │  Kafka            │───▶│  Spark Structured Streaming  │    │
-│  │                   │    │                              │    │
-│  │  Topics:          │    │  1. Deserialize trace spans  │    │
-│  │   traces.raw      │    │  2. Extract prompt + response│    │
-│  │   classification  │    │  3. Call classifier service  │    │
-│  │   drift.alerts    │    │  4. Compute content stats    │    │
-│  │   retrain.events  │    │  5. Detect distribution drift │    │
-│  └───────────────────┘    └──────┬────────────────────────┘      │
-│                                  │                               │
-│                    ┌─────────────┼──────────────┐                │
-│                    ▼             ▼              ▼                │
-│           ┌─────────────┐ ┌──────────┐ ┌─────────────┐          │
-│           │ PostgreSQL  │ │ MongoDB  │ │ Classifier  │          │
-│           │             │ │          │ │ Service     │          │
-│           │ model meta  │ │ raw      │ │             │          │
-│           │ drift stats │ │ traces   │ │ RoBERTa     │          │
-│           │ experiments │ │ flagged  │ │ ONNX+INT8   │          │
-│           │ thresholds  │ │ content  │ │ FastAPI     │          │
-│           └─────────────┘ └──────────┘ │ ~35ms p50   │          │
-│                    │                    │ ~125MB      │          │
-│                    ▼                    └─────────────┘          │
-│           ┌──────────────┐    ┌──────────────────┐              │
-│           │   Airflow    │───▶│  Retrain Pipeline │             │
-│           │              │    │  (drift-triggered) │            │
-│           │ drift_check  │    │                    │             │
-│           │ retrain_dag  │    │  blue/green swap   │             │
-│           │ data_etl     │    └──────────────────┘              │
-│           └──────────────┘                                      │
+│  ┌───────────────────────────────────┐                         │
+│  │  OTel Collector (2 replicas)      │ fans out to:            │
+│  │                                   │──▶ Kafka (traces.raw)   │
+│  │  2 replicas prevent telemetry     │──▶ Jaeger (traces UI)   │
+│  │  loss if one pod restarts         │──▶ Prometheus metrics   │
+│  └───────────────────────────────────┘                         │
+│                      │                                         │
+│                      ▼ traces.raw topic                        │
+│  ┌───────────────────────────────────────────────────────┐     │
+│  │  Stream Processor (Python, 2 replicas)                │     │
+│  │                                                       │     │
+│  │  1. Deserialize span → extract prompt + response      │     │
+│  │  2. POST to classifier service (HTTP, ~35ms)          │     │
+│  │  3. Write to PostgreSQL classifications table         │     │
+│  │  4. Write harmful content to MongoDB (retraining)     │     │
+│  │  5. Publish to classification Kafka topic             │     │
+│  └───────────────────────────────────────────────────────┘     │
+│                                                                │
+│  ┌──────────────┐  ┌──────────┐  ┌─────────────────────────┐  │
+│  │ Classifier   │  │PostgreSQL│  │ MongoDB                 │  │
+│  │ Service      │  │          │  │                         │  │
+│  │              │  │classific.│  │ harmful content only    │  │
+│  │ RoBERTa      │  │drift_stat│  │ (retraining corpus)     │  │
+│  │ ONNX+INT8    │  │model_reg.│  │                         │  │
+│  │ ~35ms p50    │  │experim.  │  │ Jaeger already stores   │  │
+│  │ ~125MB       │  └──────────┘  │ all traces; MongoDB is  │  │
+│  │              │                │ the permanent archive   │  │
+│  │ Loads active │                │ for flagged content only│  │
+│  │ model from   │                └─────────────────────────┘  │
+│  │ model_reg on │                                              │
+│  │ startup      │                                              │
+│  └──────────────┘                                              │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────┐      │
+│  │  Spark (batch, scheduled by Airflow every 15 min)   │      │
+│  │  Reads classifications table → computes PSI / JSD   │      │
+│  │  Writes drift_stats → triggers retrain if breached  │      │
+│  └──────────────────────────────────────────────────────┘      │
+│                                                                │
+│  ┌──────────────┐    ┌──────────────────────────────────┐      │
+│  │   Airflow    │───▶│  Retrain Pipeline                │      │
+│  │ drift_check  │    │  fine-tune → MLflow eval         │      │
+│  │ retrain_dag  │    │  promote in model_registry       │      │
+│  │ data_etl     │    │  kubectl rollout restart         │      │
+│  └──────────────┘    └──────────────────────────────────┘      │
 │                                                                │
 │  ┌──────────────────────────────────────────────────────┐      │
 │  │  Prometheus + Grafana + Jaeger                       │      │
 │  │  4 dashboards | alerting rules | distributed traces  │      │
 │  └──────────────────────────────────────────────────────┘      │
-│                                                                │
 │  All provisioned via Terraform                                 │
 │  MinIO for model artifacts | MLflow for experiment tracking    │
 └────────────────────────────────────────────────────────────────┘
@@ -92,11 +95,12 @@ A production-grade platform for real-time toxicity classification, distributed t
 
 | Layer | Technology |
 |---|---|
-| **Classifier** | RoBERTa, ONNX Runtime, HuggingFace Optimum, FastAPI |
-| **Streaming** | Apache Kafka (Strimzi), Apache Spark Structured Streaming |
+| **Classifier** | RoBERTa, ONNX Runtime, HuggingFace Optimum, FastAPI (sync routes) |
+| **Stream Processing** | Apache Kafka (Strimzi), Python consumer (classification hot path) |
+| **Batch / Drift** | Apache Spark (PSI/JSD aggregations, scheduled via Airflow) |
 | **Orchestration** | Apache Airflow |
-| **Storage** | PostgreSQL (model metadata, drift stats), MongoDB (raw traces), MinIO (model artifacts) |
-| **Observability** | Prometheus, Grafana (4 dashboards), Jaeger, OpenTelemetry Collector |
+| **Storage** | PostgreSQL (classifications, drift stats, model registry), MongoDB (flagged content corpus), MinIO (model artifacts) |
+| **Observability** | Prometheus, Grafana (4 dashboards), Jaeger, OpenTelemetry Collector (2 replicas) |
 | **Experiment Tracking** | MLflow |
 | **Infrastructure** | Kubernetes (k3d/k3s), Terraform, Helm |
 | **Python Stack** | Python 3.11, pyenv, PyTorch (CUDA), pyspark, psycopg2, pymongo |
@@ -182,11 +186,18 @@ This script exports a DistilBERT model to ONNX, applies INT8 quantization, bench
 
 ## Classifier Service
 
-The classifier is a FastAPI service wrapping the ONNX Runtime session, with built-in Prometheus metrics and a hot-reload endpoint for zero-downtime model swaps after Airflow retraining.
+The classifier is a FastAPI service wrapping the ONNX Runtime session, with built-in Prometheus metrics. Routes are **synchronous** (not async) so `SESSION.run()` runs in uvicorn's thread pool and does not block the event loop under concurrent requests.
+
+On startup, the service queries `model_registry` for the row with `status = 'active'` and loads that model path from MinIO. If the DB is unreachable it falls back to the `MODEL_PATH` env var. This makes the registry the source of truth from the first deploy, not only after the first retrain.
+
+**Model swaps** (after Airflow retraining) use a rolling restart, not an in-process reload:
+1. Airflow promotes the new model version to `status = 'active'` in `model_registry`
+2. Airflow runs `kubectl rollout restart deployment/classifier`
+3. Kubernetes replaces pods one at a time; each new pod picks up the active model on startup
+4. All replicas end up on the same version with zero downtime
 
 **Endpoints:**
 - `POST /classify` — classify a text string, returns label, confidence, latency, and model version
-- `POST /reload` — hot-swap the model (called by Airflow post-retrain)
 - `GET /health` — liveness check
 
 **Prometheus metrics exposed:**
@@ -280,20 +291,21 @@ sdk.start();
 
 ### Phase 2 — Streaming + Orchestration (Weeks 4-6)
 
-**Week 4: Kafka + Spark**
+**Week 4: Kafka + Stream Processor**
 - Deploy Kafka (Strimzi) via Terraform
-- Configure OTel Collector to fan out traces to Kafka
-- Write Spark Structured Streaming job (consume → classify → drift detect)
-- Deploy spark-on-k8s-operator via Terraform
+- Configure OTel Collector to fan out traces to Kafka (`traces.raw` topic)
+- Write Python stream-processor service (`services/stream-processor/`): Kafka consumer → classifier HTTP call → PostgreSQL write → MongoDB write (harmful only) → publish to `classification` topic
+- Deploy stream-processor as 2-replica K8s Deployment
 
-**Week 5: Airflow + auto-retraining**
-- Deploy Airflow via Terraform
-- Write `drift_monitor_dag`, `retrain_dag`, `data_pipeline_dag`
-- Implement blue/green model swap (K8s Service selector + `/reload` endpoint)
+**Week 5: Spark drift detection + Airflow**
+- Deploy spark-on-k8s-operator via Terraform
+- Write Spark batch job (`ml/drift/`): reads PostgreSQL `classifications` table, computes PSI/JSD/confidence decay over time windows, writes to `drift_stats`
+- Deploy Airflow via Terraform; write `drift_monitor_dag` (runs Spark batch on schedule), `retrain_dag`, `data_pipeline_dag`
+- Implement model swap via rolling restart: Airflow promotes new model in `model_registry` → `kubectl rollout restart` → new pods pull active model from MinIO on startup
 - Set up MLflow for experiment tracking
 
 **Week 6: Drift simulation + integration**
-- Build data simulator with controllable toxicity distribution
+- Build data simulator (`services/data-simulator/`) with controllable toxicity distribution
 - End-to-end test: normal → gradual drift → sudden drift → retrain → new model live
 - Load test: verify pipeline handles backpressure
 

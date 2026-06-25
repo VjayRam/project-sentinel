@@ -9,6 +9,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY services/classifier/main.py .
 
+# Model artifacts are mounted at runtime via K8s volume or built-in via CI.
+# Default paths match what optimize.py produces under models/onnx_quantized/.
+ENV MODEL_PATH=/models/onnx_quantized/model.onnx
+ENV TOKENIZER_PATH=/models/onnx_quantized
+ENV MODEL_VERSION=v1
+
 USER appuser
 
 EXPOSE 8080
