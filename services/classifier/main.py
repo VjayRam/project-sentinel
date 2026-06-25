@@ -10,6 +10,7 @@ from transformers import AutoTokenizer
 
 try:
     import psycopg2
+
     _DB_AVAILABLE = True
 except ImportError:
     _DB_AVAILABLE = False
@@ -65,7 +66,9 @@ def _load_active_model() -> tuple[str, str]:
                 print(f"Loaded active model from registry: {row[1]} @ {row[0]}")
                 return row[0], row[1]
         except Exception as exc:
-            print(f"Warning: model_registry unreachable ({exc}), falling back to env vars")
+            print(
+                f"Warning: model_registry unreachable ({exc}), falling back to env vars"
+            )
 
     path = os.getenv("MODEL_PATH", "/models/onnx_quantized/model.onnx")
     version = os.getenv("MODEL_VERSION", "v1")
@@ -81,7 +84,9 @@ def create_session(model_path: str) -> ort.InferenceSession:
     so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     so.enable_mem_pattern = True
     so.enable_cpu_mem_arena = True
-    return ort.InferenceSession(model_path, sess_options=so, providers=["CPUExecutionProvider"])
+    return ort.InferenceSession(
+        model_path, sess_options=so, providers=["CPUExecutionProvider"]
+    )
 
 
 TOKENIZER_PATH = os.getenv("TOKENIZER_PATH", "/models/onnx_quantized")

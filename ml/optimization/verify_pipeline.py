@@ -27,7 +27,9 @@ print(f"  Dummy model: {DUMMY_MODEL}")
 print("=" * 60)
 
 
-def make_session(model_path: str, provider: str = "CPUExecutionProvider") -> ort.InferenceSession:
+def make_session(
+    model_path: str, provider: str = "CPUExecutionProvider"
+) -> ort.InferenceSession:
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.intra_op_num_threads = 4
@@ -35,7 +37,9 @@ def make_session(model_path: str, provider: str = "CPUExecutionProvider") -> ort
     return ort.InferenceSession(model_path, sess_options=so, providers=[provider])
 
 
-def benchmark(session: ort.InferenceSession, inputs: dict, n: int = 100) -> tuple[float, float]:
+def benchmark(
+    session: ort.InferenceSession, inputs: dict, n: int = 100
+) -> tuple[float, float]:
     for _ in range(10):
         session.run(None, inputs)
     latencies = []
@@ -47,7 +51,7 @@ def benchmark(session: ort.InferenceSession, inputs: dict, n: int = 100) -> tupl
 
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-onnx_dir  = OUT_DIR / "onnx"
+onnx_dir = OUT_DIR / "onnx"
 quant_dir = OUT_DIR / "quantized"
 quant_dir.mkdir(parents=True, exist_ok=True)
 
@@ -60,7 +64,7 @@ print(f"   Saved → {onnx_dir}")
 
 # 2. Quantize
 print("2. Applying INT8 dynamic quantization...")
-onnx_path  = onnx_dir / "model.onnx"
+onnx_path = onnx_dir / "model.onnx"
 quant_path = quant_dir / "model.onnx"
 quantize_dynamic(
     model_input=str(onnx_path),
@@ -68,17 +72,27 @@ quantize_dynamic(
     weight_type=QuantType.QInt8,
     extra_options={"MatMulConstBOnly": True},
 )
-size_onnx  = os.path.getsize(onnx_path) / 1e6
+size_onnx = os.path.getsize(onnx_path) / 1e6
 size_quant = os.path.getsize(quant_path) / 1e6
 print(f"   ONNX FP32:  {size_onnx:.1f} MB")
-print(f"   ONNX INT8:  {size_quant:.1f} MB  ({(1 - size_quant/size_onnx)*100:.0f}% reduction)")
+print(
+    f"   ONNX INT8:  {size_quant:.1f} MB  ({(1 - size_quant / size_onnx) * 100:.0f}% reduction)"
+)
 
 # 3. Benchmark
 text = "This is a test sentence for benchmarking inference latency."
-enc = tokenizer(text, return_tensors="np", padding="max_length",
-                max_length=MAX_LENGTH, truncation=True)
-ort_inputs = {k: v.astype(np.int64) for k, v in enc.items()
-              if k in ["input_ids", "attention_mask"]}
+enc = tokenizer(
+    text,
+    return_tensors="np",
+    padding="max_length",
+    max_length=MAX_LENGTH,
+    truncation=True,
+)
+ort_inputs = {
+    k: v.astype(np.int64)
+    for k, v in enc.items()
+    if k in ["input_ids", "attention_mask"]
+}
 
 print("3. Benchmarking...")
 results = []
@@ -105,7 +119,7 @@ else:
 print("4. Verifying logit drift...")
 out_fp32 = make_session(str(onnx_path)).run(None, ort_inputs)[0]
 out_int8 = make_session(str(quant_path)).run(None, ort_inputs)[0]
-max_diff  = float(np.max(np.abs(out_fp32 - out_int8)))
+max_diff = float(np.max(np.abs(out_fp32 - out_int8)))
 same_pred = np.argmax(out_fp32) == np.argmax(out_int8)
 print(f"   Max logit diff:  {max_diff:.6f}")
 print(f"   Same prediction: {same_pred}")

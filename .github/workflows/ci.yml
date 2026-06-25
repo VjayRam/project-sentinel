@@ -34,7 +34,7 @@ jobs:
 
       - name: Install test dependencies
         run: |
-          pip install pytest httpx fastapi uvicorn pydantic numpy prometheus-client
+          pip install pytest httpx fastapi uvicorn pydantic numpy prometheus-client scikit-learn pandas
 
       - name: Run unit tests
         run: pytest tests/unit -v --tb=short

@@ -41,20 +41,24 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 try:
     import psycopg2
+
     _PSYCOPG2_AVAILABLE = True
 except ImportError:
     _PSYCOPG2_AVAILABLE = False
 
-MODEL_HF   = "VijayRam1812/content-classifier-roberta"
-ROOT_DIR   = Path(__file__).parent.parent.parent
+MODEL_HF = "VijayRam1812/content-classifier-roberta"
+ROOT_DIR = Path(__file__).parent.parent.parent
 MODELS_DIR = ROOT_DIR / "models"
-DATA_PATH  = ROOT_DIR / "data" / "benchmark" / "test_dataset.csv"
+DATA_PATH = ROOT_DIR / "data" / "benchmark" / "test_dataset.csv"
 MAX_LENGTH = 512
-WARMUP_N   = 20   # samples used for ORT session warmup before timing
+WARMUP_N = 20  # samples used for ORT session warmup before timing
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def make_ort_session(model_path: str, provider: str = "CPUExecutionProvider") -> ort.InferenceSession:
+
+def make_ort_session(
+    model_path: str, provider: str = "CPUExecutionProvider"
+) -> ort.InferenceSession:
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.intra_op_num_threads = 4
@@ -115,14 +119,18 @@ def run_pytorch_dataset(
 
 def latency_stats(latencies: list[float]) -> tuple[float, float, float]:
     a = np.array(latencies)
-    return float(np.percentile(a, 50)), float(np.percentile(a, 95)), float(np.percentile(a, 99))
+    return (
+        float(np.percentile(a, 50)),
+        float(np.percentile(a, 95)),
+        float(np.percentile(a, 99)),
+    )
 
 
 def accuracy_metrics(labels: list[int], preds: list[int], probs: list[float]) -> dict:
     return {
         "accuracy": round(accuracy_score(labels, preds), 4),
-        "f1":       round(f1_score(labels, preds), 4),
-        "auc_roc":  round(roc_auc_score(labels, probs), 4),
+        "f1": round(f1_score(labels, preds), 4),
+        "auc_roc": round(roc_auc_score(labels, probs), 4),
     }
 
 
@@ -139,9 +147,13 @@ def _model_version() -> str:
     """Generate a collision-resistant version string: v{YYYYMMDD}-{git-sha}."""
     date = datetime.now(timezone.utc).strftime("%Y%m%d")
     try:
-        sha = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
-        ).decode().strip()
+        sha = (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
     except Exception:
         sha = "local"
     return f"v{date}-{sha}"
@@ -184,10 +196,15 @@ def register_model(version: str, onnx_path: str, result: dict) -> None:
                     trained_at     = NOW()
                 """,
                 (
-                    version, onnx_path,
-                    result.get("accuracy"), result.get("f1"), result.get("auc_roc"),
+                    version,
+                    onnx_path,
+                    result.get("accuracy"),
+                    result.get("f1"),
+                    result.get("auc_roc"),
                     result.get("size_mb"),
-                    result.get("p50_ms"), result.get("p95_ms"), result.get("p99_ms"),
+                    result.get("p50_ms"),
+                    result.get("p95_ms"),
+                    result.get("p99_ms"),
                 ),
             )
         conn.close()
@@ -197,6 +214,7 @@ def register_model(version: str, onnx_path: str, result: dict) -> None:
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     print("=" * 65)
@@ -208,7 +226,7 @@ def main() -> None:
     # ── load dataset ─────────────────────────────────────────────────────────
     section("Loading dataset")
     df = pd.read_csv(DATA_PATH)
-    texts  = df["raw_text"].tolist()
+    texts = df["raw_text"].tolist()
     labels = df["label"].astype(int).tolist()
     print(f"  Rows:    {len(df)}")
     print(f"  Label 0 (safe):    {labels.count(0)}")
@@ -217,9 +235,9 @@ def main() -> None:
     # ── create output dirs ───────────────────────────────────────────────────
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     tokenizer_dir = MODELS_DIR / "tokenizer"
-    onnx_dir      = MODELS_DIR / "onnx"
-    opt_dir       = MODELS_DIR / "onnx_optimized"
-    quant_dir     = MODELS_DIR / "onnx_quantized"
+    onnx_dir = MODELS_DIR / "onnx"
+    opt_dir = MODELS_DIR / "onnx_optimized"
+    quant_dir = MODELS_DIR / "onnx_quantized"
     for d in [tokenizer_dir, onnx_dir, opt_dir, quant_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -232,7 +250,7 @@ def main() -> None:
 
     print(f"  Tokenizing {len(texts)} samples at max_length={MAX_LENGTH}...")
     encoded_ort = []
-    encoded_pt  = []
+    encoded_pt = []
     for text in texts:
         enc = tokenizer(
             text,
@@ -261,10 +279,19 @@ def main() -> None:
     p50, p95, p99 = latency_stats(lats)
     metrics = accuracy_metrics(labels, preds, probs)
     print(f"  p50={p50:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms")
-    print(f"  Accuracy={metrics['accuracy']}  F1={metrics['f1']}  AUC-ROC={metrics['auc_roc']}")
-    results.append({"variant": "PyTorch FP32", "size_mb": round(pt_size_mb, 1),
-                    "p50_ms": round(p50, 1), "p95_ms": round(p95, 1), "p99_ms": round(p99, 1),
-                    **metrics})
+    print(
+        f"  Accuracy={metrics['accuracy']}  F1={metrics['f1']}  AUC-ROC={metrics['auc_roc']}"
+    )
+    results.append(
+        {
+            "variant": "PyTorch FP32",
+            "size_mb": round(pt_size_mb, 1),
+            "p50_ms": round(p50, 1),
+            "p95_ms": round(p95, 1),
+            "p99_ms": round(p99, 1),
+            **metrics,
+        }
+    )
     baseline_preds = preds
     del pt_model
 
@@ -281,16 +308,25 @@ def main() -> None:
     p50, p95, p99 = latency_stats(lats)
     metrics = accuracy_metrics(labels, preds, probs)
     print(f"  p50={p50:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms")
-    print(f"  Accuracy={metrics['accuracy']}  F1={metrics['f1']}  AUC-ROC={metrics['auc_roc']}")
+    print(
+        f"  Accuracy={metrics['accuracy']}  F1={metrics['f1']}  AUC-ROC={metrics['auc_roc']}"
+    )
     agreement = sum(a == b for a, b in zip(baseline_preds, preds)) / len(preds)
     print(f"  Prediction agreement with PyTorch FP32: {agreement:.4f}")
-    results.append({"variant": "ONNX FP32", "size_mb": round(size_onnx, 1),
-                    "p50_ms": round(p50, 1), "p95_ms": round(p95, 1), "p99_ms": round(p99, 1),
-                    **metrics})
+    results.append(
+        {
+            "variant": "ONNX FP32",
+            "size_mb": round(size_onnx, 1),
+            "p50_ms": round(p50, 1),
+            "p95_ms": round(p95, 1),
+            "p99_ms": round(p99, 1),
+            **metrics,
+        }
+    )
 
     # ── step 2: O2 graph optimization ────────────────────────────────────────
     section("Step 2 — O2 graph optimization")
-    optimizer  = ORTOptimizer.from_pretrained(ort_model)
+    optimizer = ORTOptimizer.from_pretrained(ort_model)
     opt_config = OptimizationConfig(
         optimization_level=2,
         enable_transformers_specific_optimizations=True,
@@ -308,10 +344,19 @@ def main() -> None:
     p50, p95, p99 = latency_stats(lats)
     metrics = accuracy_metrics(labels, preds, probs)
     print(f"  p50={p50:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms")
-    print(f"  Accuracy={metrics['accuracy']}  F1={metrics['f1']}  AUC-ROC={metrics['auc_roc']}")
-    results.append({"variant": "ONNX O2", "size_mb": round(size_opt, 1),
-                    "p50_ms": round(p50, 1), "p95_ms": round(p95, 1), "p99_ms": round(p99, 1),
-                    **metrics})
+    print(
+        f"  Accuracy={metrics['accuracy']}  F1={metrics['f1']}  AUC-ROC={metrics['auc_roc']}"
+    )
+    results.append(
+        {
+            "variant": "ONNX O2",
+            "size_mb": round(size_opt, 1),
+            "p50_ms": round(p50, 1),
+            "p95_ms": round(p95, 1),
+            "p99_ms": round(p99, 1),
+            **metrics,
+        }
+    )
 
     # ── step 3: INT8 dynamic quantization ────────────────────────────────────
     section("Step 3 — INT8 dynamic quantization")
@@ -322,7 +367,7 @@ def main() -> None:
         weight_type=QuantType.QInt8,
         extra_options={"MatMulConstBOnly": True},
     )
-    tokenizer.save_pretrained(quant_dir)   # self-contained for the classifier service
+    tokenizer.save_pretrained(quant_dir)  # self-contained for the classifier service
     size_quant = model_size_mb(quant_path)
     print(f"  Size: {size_quant:.1f} MB  →  {quant_dir}")
     print(f"  Running inference on {len(texts)} samples...")
@@ -331,32 +376,55 @@ def main() -> None:
     p50, p95, p99 = latency_stats(lats)
     metrics = accuracy_metrics(labels, preds, probs)
     print(f"  p50={p50:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms")
-    print(f"  Accuracy={metrics['accuracy']}  F1={metrics['f1']}  AUC-ROC={metrics['auc_roc']}")
+    print(
+        f"  Accuracy={metrics['accuracy']}  F1={metrics['f1']}  AUC-ROC={metrics['auc_roc']}"
+    )
     agreement = sum(a == b for a, b in zip(baseline_preds, preds)) / len(preds)
     print(f"  Prediction agreement with PyTorch FP32: {agreement:.4f}")
-    results.append({"variant": "ONNX O2 + INT8", "size_mb": round(size_quant, 1),
-                    "p50_ms": round(p50, 1), "p95_ms": round(p95, 1), "p99_ms": round(p99, 1),
-                    **metrics})
+    results.append(
+        {
+            "variant": "ONNX O2 + INT8",
+            "size_mb": round(size_quant, 1),
+            "p50_ms": round(p50, 1),
+            "p95_ms": round(p95, 1),
+            "p99_ms": round(p99, 1),
+            **metrics,
+        }
+    )
 
     # ── GPU (if available) ───────────────────────────────────────────────────
     if "CUDAExecutionProvider" in ort.get_available_providers():
         section("GPU benchmark (CUDAExecutionProvider)")
-        for variant, path in [("ONNX FP32 (GPU)", onnx_path), ("ONNX O2+INT8 (GPU)", quant_path)]:
+        for variant, path in [
+            ("ONNX FP32 (GPU)", onnx_path),
+            ("ONNX O2+INT8 (GPU)", quant_path),
+        ]:
             sess_gpu = make_ort_session(str(path), "CUDAExecutionProvider")
             lats, preds, probs = run_ort_dataset(sess_gpu, encoded_ort)
             p50, p95, p99 = latency_stats(lats)
             metrics = accuracy_metrics(labels, preds, probs)
             size = model_size_mb(path)
-            print(f"  {variant}: p50={p50:.1f}ms  p95={p95:.1f}ms  Acc={metrics['accuracy']}")
-            results.append({"variant": variant, "size_mb": round(size, 1),
-                            "p50_ms": round(p50, 1), "p95_ms": round(p95, 1), "p99_ms": round(p99, 1),
-                            **metrics})
+            print(
+                f"  {variant}: p50={p50:.1f}ms  p95={p95:.1f}ms  Acc={metrics['accuracy']}"
+            )
+            results.append(
+                {
+                    "variant": variant,
+                    "size_mb": round(size, 1),
+                    "p50_ms": round(p50, 1),
+                    "p95_ms": round(p95, 1),
+                    "p99_ms": round(p99, 1),
+                    **metrics,
+                }
+            )
     else:
         print("\n  GPU: CUDAExecutionProvider not available — skipping")
 
     # ── results table ────────────────────────────────────────────────────────
     print("\n" + "=" * 80)
-    print(f"{'Variant':<22} {'MB':>6} {'p50':>6} {'p95':>6} {'p99':>6} {'Acc':>7} {'F1':>7} {'AUC':>7}")
+    print(
+        f"{'Variant':<22} {'MB':>6} {'p50':>6} {'p95':>6} {'p99':>6} {'Acc':>7} {'F1':>7} {'AUC':>7}"
+    )
     print("-" * 80)
     for r in results:
         print(
@@ -367,21 +435,31 @@ def main() -> None:
     if len(results) >= 4:
         b, f = results[0], results[3]
         print("-" * 80)
-        print(f"  Size reduction  (FP32 → INT8): {(1 - f['size_mb'] / b['size_mb']) * 100:.0f}%")
-        print(f"  Latency p50 reduction:          {(1 - f['p50_ms'] / b['p50_ms']) * 100:.0f}%")
-        print(f"  Accuracy delta:                 {f.get('accuracy', 0) - b.get('accuracy', 0):+.4f}")
+        print(
+            f"  Size reduction  (FP32 → INT8): {(1 - f['size_mb'] / b['size_mb']) * 100:.0f}%"
+        )
+        print(
+            f"  Latency p50 reduction:          {(1 - f['p50_ms'] / b['p50_ms']) * 100:.0f}%"
+        )
+        print(
+            f"  Accuracy delta:                 {f.get('accuracy', 0) - b.get('accuracy', 0):+.4f}"
+        )
     print("=" * 80)
 
     # ── save report ──────────────────────────────────────────────────────────
     report_path = MODELS_DIR / "benchmark.json"
     with open(report_path, "w") as fh:
-        json.dump({
-            "model":        MODEL_HF,
-            "dataset":      str(DATA_PATH),
-            "n_samples":    len(texts),
-            "max_length":   MAX_LENGTH,
-            "results":      results,
-        }, fh, indent=2)
+        json.dump(
+            {
+                "model": MODEL_HF,
+                "dataset": str(DATA_PATH),
+                "n_samples": len(texts),
+                "max_length": MAX_LENGTH,
+                "results": results,
+            },
+            fh,
+            indent=2,
+        )
     print(f"\n  Report → {report_path}")
     print(f"  Deploy → {quant_dir}/model.onnx")
 
