@@ -193,43 +193,50 @@ so.enable_cpu_mem_arena = True       # pre-allocate memory pool
 ┌────────────────────────────────────────────────────────────────┐
 │                    SENTINEL CLUSTER (K8s)                       │
 │                                                                │
-│  ┌──────────────────┐                                          │
-│  │  OTel Collector   │  Receives traces, fans out to:          │
-│  │  (DaemonSet)      │──┬─▶ Kafka (traces.raw topic)          │
-│  │                   │  ├─▶ Jaeger (trace visualization)       │
-│  │                   │  └─▶ Prometheus (spanmetrics connector)  │
-│  └──────────────────┘                                          │
+│  ┌───────────────────────────────────┐                         │
+│  │  OTel Collector (2 replicas)      │  Receives traces:       │
+│  │                                   │──┬─▶ Kafka (traces.raw) │
+│  │  2 replicas — no single point     │  ├─▶ Jaeger (traces UI) │
+│  │  of failure for telemetry         │  └─▶ Prometheus metrics │
+│  └───────────────────────────────────┘                         │
 │           │                                                    │
 │           ▼                                                    │
-│  ┌──────────────────┐    ┌─────────────────────────────┐       │
-│  │  Kafka            │───▶│  Spark Structured Streaming  │      │
-│  │                   │    │                               │      │
-│  │  Topics:          │    │  1. Deserialize trace spans   │      │
-│  │   traces.raw      │    │  2. Extract prompt + response │      │
-│  │   classification  │    │  3. Call classifier service    │      │
-│  │   drift.alerts    │    │  4. Compute content stats     │      │
-│  │   retrain.events  │    │  5. Detect distribution drift │      │
-│  └──────────────────┘    └──────┬────────────────────────┘      │
-│                                  │                               │
-│                    ┌─────────────┼──────────────┐                │
-│                    ▼             ▼              ▼                │
-│           ┌─────────────┐ ┌──────────┐ ┌─────────────┐          │
-│           │ PostgreSQL  │ │ MongoDB  │ │ Classifier  │          │
-│           │             │ │          │ │ Service     │          │
-│           │ model meta  │ │ raw      │ │             │          │
-│           │ drift stats │ │ traces   │ │ RoBERTa     │          │
-│           │ experiments │ │ flagged  │ │ ONNX+INT8   │          │
-│           │ thresholds  │ │ content  │ │ FastAPI     │          │
-│           └─────────────┘ └──────────┘ │ ~35ms p50   │          │
-│                    │                    │ ~125MB      │          │
-│                    ▼                    └─────────────┘          │
-│           ┌──────────────┐    ┌──────────────────┐              │
-│           │   Airflow    │───▶│  Retrain Pipeline │             │
-│           │              │    │  (when drift      │             │
-│           │ drift_check  │    │   detected)       │             │
-│           │ retrain_dag  │    │                    │             │
-│           │ data_etl     │    │  blue/green swap   │             │
-│           └──────────────┘    └──────────────────┘              │
+│  ┌──────────────────┐                                          │
+│  │  Kafka            │                                         │
+│  │                   │                                         │
+│  │  Topics:          │                                         │
+│  │   traces.raw ─────┼──▶ Stream Processor (Python)           │
+│  │   classification  │    1. Deserialize spans                 │
+│  │   drift.alerts    │    2. Extract prompt + response         │
+│  │   retrain.events  │    3. Call classifier (HTTP)            │
+│  └──────────────────┘    4. Write to PostgreSQL + MongoDB      │
+│           │               5. Publish to classification topic   │
+│           │                                                    │
+│           ▼ (classification topic, 15-min batch schedule)      │
+│  ┌──────────────────────────────────────────────────────┐      │
+│  │  Spark (batch, via Airflow schedule)                 │      │
+│  │  Reads PostgreSQL classifications table              │      │
+│  │  Computes PSI / JSD / confidence decay over windows │      │
+│  │  Writes to drift_stats — triggers retrain if breach │      │
+│  └──────────────────────────────────────────────────────┘      │
+│                                                                │
+│           ┌─────────────┐ ┌──────────┐ ┌─────────────┐        │
+│           │ PostgreSQL  │ │ MongoDB  │ │ Classifier  │        │
+│           │             │ │          │ │ Service     │        │
+│           │ classific.  │ │ flagged  │ │             │        │
+│           │ drift_stats │ │ content  │ │ RoBERTa     │        │
+│           │ model_reg.  │ │ (for     │ │ ONNX+INT8   │        │
+│           │ experiments │ │ retrain) │ │ FastAPI     │        │
+│           └─────────────┘ └──────────┘ │ ~35ms p50   │        │
+│                    │                    │ model from  │        │
+│                    ▼                    │ MinIO init  │        │
+│           ┌──────────────┐              └─────────────┘        │
+│           │   Airflow    │──▶ Retrain Pipeline                 │
+│           │              │    drift-triggered fine-tuning       │
+│           │ drift_check  │    A/B eval via MLflow               │
+│           │ retrain_dag  │    rolling restart (no /reload)      │
+│           │ data_etl     │    kubectl rollout restart           │
+│           └──────────────┘                                     │
 │                                                                │
 │  ┌──────────────────────────────────────────────────────┐      │
 │  │  Prometheus + Grafana + Jaeger                       │      │
@@ -492,19 +499,13 @@ async def classify(request: ClassifyRequest):
         model_version=CURRENT_VERSION
     )
 
-# --- Hot reload endpoint (called by Airflow after retraining) ---
-@app.post("/reload")
-async def reload_model(version: str, model_path: str):
-    global SESSION, CURRENT_VERSION
-    new_session = create_session(model_path)
-    SESSION = new_session
-    CURRENT_VERSION = version
-    MODEL_VERSION.labels(version=version).set(1)
-    return {"status": "reloaded", "version": version}
-
 # --- Health check ---
+# Model swaps are done via rolling restart (kubectl rollout restart deployment/classifier).
+# Each new pod queries model_registry on startup and loads the active model from MinIO.
+# There is no /reload endpoint — in-process reload would only hit one pod out of N replicas,
+# causing a silent model version split that's undetectable from the Service level.
 @app.get("/health")
-async def health():
+def health():
     return {"status": "ok", "model_version": CURRENT_VERSION}
 ```
 
@@ -537,20 +538,36 @@ async def health():
 
 ### Phase 2: Streaming + Orchestration (Week 4-6)
 
-**Week 4: Kafka + Spark**
+**Week 4: Kafka + Stream Processor**
 1. Deploy Kafka (Strimzi) via Terraform
-2. Configure OTel Collector to export traces to Kafka
-3. Write Spark Structured Streaming job (consume → classify → drift detect)
-4. Deploy spark-on-k8s-operator via Terraform
+2. Configure OTel Collector to export traces to Kafka (traces.raw topic)
+3. Write the Python stream-processor service (services/stream-processor/):
+   - Kafka consumer on traces.raw
+   - Extract prompt + response from span attributes
+   - POST to classifier service
+   - Write classification result to PostgreSQL classifications table
+   - Write flagged (harmful) content to MongoDB for retraining corpus
+   - Publish result to classification Kafka topic
+4. Deploy stream-processor as a K8s Deployment (2 replicas)
 
-**Week 5: Airflow + auto-retraining**
-1. Deploy Airflow via Terraform
-2. Write drift_monitor_dag, retrain_dag, data_pipeline_dag
-3. Implement blue/green model swap (K8s Service selector + classifier /reload endpoint)
-4. Set up MLflow for experiment tracking
+**Week 5: Spark drift detection + Airflow**
+1. Deploy spark-on-k8s-operator via Terraform
+2. Write Spark batch job (ml/drift/):
+   - Reads PostgreSQL classifications table
+   - Computes PSI, JSD, confidence decay over configurable time windows
+   - Writes results to drift_stats table
+   - Publishes to drift.alerts topic if threshold breached
+3. Deploy Airflow via Terraform
+4. Write DAGs: drift_monitor_dag (runs Spark batch on schedule), retrain_dag, data_pipeline_dag
+5. Implement model swap via rolling restart:
+   - Airflow calls optimize.py → writes staging row to model_registry
+   - Airflow evaluates on hold-out set, promotes to active via UPDATE
+   - Airflow runs: kubectl rollout restart deployment/classifier
+   - New pods start up, query model_registry, pull active model from MinIO
+6. Set up MLflow for experiment tracking
 
 **Week 6: Drift simulation + integration**
-1. Build data simulator with controllable toxicity distribution
+1. Build data simulator (services/data-simulator/) with controllable toxicity distribution
 2. Test: normal → gradual drift → sudden drift → retrain → new model live
 3. End-to-end trace in Jaeger from chat message through classification
 4. Load test: verify pipeline handles backpressure
@@ -568,7 +585,7 @@ After completing this project, your resume Projects section gains:
 *Python | FastAPI | ONNX Runtime | Terraform | Kubernetes | Kafka | Spark | Airflow | Prometheus | Grafana | OpenTelemetry*
 
 - Optimized RoBERTa toxicity classifier for production inference using ONNX Runtime with INT8 dynamic quantization — reducing model size by 75% (500→125 MB) and p95 latency by 3x (110→38 ms) with <0.2% accuracy degradation.
-- Built real-time content safety pipeline using Spark Structured Streaming consuming OTel traces from a separate LLM application via Kafka, classifying ~X requests/sec with drift detection (PSI, JSD, confidence decay).
+- Built post-delivery LLM content monitoring pipeline: Python Kafka consumer classifies ~X req/sec via ONNX classifier; Spark batch job computes PSI/JSD drift metrics over sliding windows and triggers automated retraining when distribution shift is detected.
 - Provisioned end-to-end infrastructure on Kubernetes using Terraform (11 services across 4 namespaces), with Prometheus custom metrics, 4 Grafana dashboards, and OTel distributed tracing via Jaeger.
 - Orchestrated automated model retraining with Airflow — drift-triggered fine-tuning pipeline with A/B evaluation via MLflow and zero-downtime blue/green K8s deployment.
 
