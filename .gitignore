@@ -16,3 +16,6 @@ data/
 *.csv
 .DS_Store
 .claude/
+.venv/
+*.log
+.ruff_cache/
