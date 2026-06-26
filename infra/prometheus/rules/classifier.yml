@@ -1,0 +1,120 @@
+groups:
+  - name: classifier.health
+    interval: 15s
+    rules:
+      - alert: ClassifierDown
+        expr: up{job="classifier"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: classifier
+        annotations:
+          summary: "Classifier service is unreachable"
+          description: "Prometheus cannot scrape {{ $labels.instance }}. Pod may be crashed or /metrics/ is unavailable."
+
+      - alert: ClassifierNoTraffic
+        expr: rate(classifier_requests_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+          service: classifier
+        annotations:
+          summary: "Classifier has received no requests for 10 minutes"
+          description: "Could indicate upstream disconnection or routing issue."
+
+  - name: classifier.latency
+    interval: 15s
+    rules:
+      - record: classifier:request_latency_p50:5m
+        expr: histogram_quantile(0.50, rate(classifier_request_latency_seconds_bucket[5m]))
+
+      - record: classifier:request_latency_p95:5m
+        expr: histogram_quantile(0.95, rate(classifier_request_latency_seconds_bucket[5m]))
+
+      - record: classifier:request_latency_p99:5m
+        expr: histogram_quantile(0.99, rate(classifier_request_latency_seconds_bucket[5m]))
+
+      - alert: ClassifierHighLatencyP95
+        expr: classifier:request_latency_p95:5m > 0.2
+        for: 2m
+        labels:
+          severity: warning
+          service: classifier
+        annotations:
+          summary: "Classifier p95 latency > 200ms"
+          description: "p95={{ $value | humanizeDuration }} on {{ $labels.endpoint }}. INT8 model target is <50ms."
+
+      - alert: ClassifierHighLatencyP99
+        expr: classifier:request_latency_p99:5m > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          service: classifier
+        annotations:
+          summary: "Classifier p99 latency > 500ms"
+          description: "p99={{ $value | humanizeDuration }} on {{ $labels.endpoint }}."
+
+  - name: classifier.throughput
+    interval: 15s
+    rules:
+      - record: classifier:request_rate:5m
+        expr: sum(rate(classifier_requests_total[5m])) by (endpoint)
+
+      - alert: ClassifierBatchBackpressure
+        expr: histogram_quantile(0.90, rate(classifier_batch_size_bucket[5m])) >= 60
+        for: 5m
+        labels:
+          severity: warning
+          service: classifier
+        annotations:
+          summary: "Classifier batches consistently near MAX_BATCH_SIZE"
+          description: "p90 batch size is {{ $value }}. Queue may be backing up — consider scaling replicas or raising MAX_BATCH_SIZE."
+
+  - name: classifier.logs
+    interval: 15s
+    rules:
+      - record: classifier:log_error_rate:5m
+        expr: rate(classifier_log_errors_total[5m])
+
+      - alert: ClassifierLogErrors
+        expr: rate(classifier_log_errors_total{level="ERROR"}[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          service: classifier
+        annotations:
+          summary: "Classifier is emitting errors at >0.1/s"
+          description: "Check service logs. Error rate: {{ $value | humanize }}/s"
+
+      - alert: ClassifierCriticalErrors
+        expr: rate(classifier_log_errors_total{level="CRITICAL"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: classifier
+        annotations:
+          summary: "Classifier emitted a CRITICAL log"
+          description: "Immediate investigation required."
+
+  - name: classifier.resources
+    interval: 30s
+    rules:
+      - alert: ClassifierHighMemory
+        expr: process_resident_memory_bytes{job="classifier"} > 2 * 1024 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: warning
+          service: classifier
+        annotations:
+          summary: "Classifier RSS > 2 GB"
+          description: "Current: {{ $value | humanize1024 }}B. INT8 model should use ~500MB at most."
+
+      - alert: ClassifierFdLeak
+        expr: process_open_fds{job="classifier"} > 200
+        for: 5m
+        labels:
+          severity: warning
+          service: classifier
+        annotations:
+          summary: "Classifier has >200 open file descriptors"
+          description: "Current: {{ $value }}. Possible fd leak."
