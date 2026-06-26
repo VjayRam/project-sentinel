@@ -5,7 +5,7 @@ requires-python = ">=3.12"
 [manifest]
 members = [
     "sentinel",
-    "sentinel-ml",
+    "sentinel-classifier",
 ]
 
 [[package]]
@@ -1014,9 +1014,9 @@ dev = [
 ]
 
 [[package]]
-name = "sentinel-ml"
+name = "sentinel-classifier"
 version = "0.1.0"
-source = { virtual = "services/ml" }
+source = { virtual = "services/classifier" }
 dependencies = [
     { name = "fastapi" },
     { name = "prometheus-client" },
