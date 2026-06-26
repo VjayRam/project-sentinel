@@ -507,7 +507,7 @@ A mock that doesn't match the real interface lets tests pass while hiding bugs. 
 
 ---
 
-## 11. Prometheus scrape uses `host.docker.internal` instead of a Service endpoint
+## 11. Prometheus scrape target is not K8s-native (deferred to Phase 5)
 
 **File:** `infra/prometheus/prometheus.yml`
 **Severity:** Does not scale past a single local instance
@@ -516,17 +516,17 @@ A mock that doesn't match the real interface lets tests pass while hiding bugs. 
 
 ```yaml
 static_configs:
-  - targets: ["host.docker.internal:8000"]
+  - targets: ["host.k3d.internal:8000"]
 ```
 
-This scrapes the classifier on the Docker host — the machine running docker-compose. It works in local dev because there's one process on one machine. In production on K8s:
+`host.k3d.internal` is a hostname k3d injects into node `/etc/hosts` pointing to the Docker host. This works for local dev because the classifier runs directly on the host. In production on K8s:
 - There are multiple replicas (3 pods), each with its own IP
 - Pod IPs change on restart
-- The host is a K8s node, not a single machine
+- The host is a K8s node, not a single developer machine
 
 ### What the fix looks like
 
-In production, Prometheus discovers targets from the K8s API. The classifier gets a Kubernetes `Service`, and Prometheus uses `kubernetes_sd_configs` to discover all pods backing that Service:
+In production, Prometheus discovers targets from the K8s API. Once the classifier is deployed as a K8s Deployment (Phase 5), replace the static config with `kubernetes_sd_configs`:
 
 ```yaml
 - job_name: classifier
@@ -543,16 +543,11 @@ In production, Prometheus discovers targets from the K8s API. The classifier get
       replacement: "$1:8000"
 ```
 
-This is a Phase 3/4 item — it requires the K8s cluster to exist. For now, the `host.docker.internal` approach is acceptable for local dev only. The fix to make it correct for K8s is: add a `ServiceMonitor` CRD (if using the Prometheus Operator) or configure `kubernetes_sd_configs` directly.
-
-For local dev with the classifier also containerized (after fixing issue #1), the scrape target becomes the Docker Compose service name:
-```yaml
-targets: ["classifier:8000"]
-```
+This is a Phase 5 item — it requires the classifier to be deployed into the cluster. The `host.k3d.internal` approach is the correct local dev workaround until then.
 
 ### Why it matters
 
-The current setup is not portable beyond a single developer machine. It would need to be rewritten entirely for any deployment beyond local dev. Knowing this now avoids building Grafana dashboards around the `host.docker.internal` label before the right label scheme (`pod_ip`, `instance`) is established.
+The current setup is not portable beyond a single developer machine. Knowing this now avoids building Grafana dashboards around the `host.k3d.internal` label before the right label scheme (`pod_ip`, `instance`) is established.
 
 ---
 
@@ -656,16 +651,16 @@ Work through these in order — each one unblocks the next.
 
 | # | Issue | Priority | Status |
 |---|-------|----------|--------|
-| 1 | Dockerfile for classifier | P0 — CD is broken | [x] |
-| 2 | Remove `torch`/`optimum` from classifier deps | P0 — image size | [x] |
-| 3 | Tests for classifier service | P0 — no safety net | [x] |
-| 4 | Liveness / readiness probe split | P1 — K8s stability | [ ] |
-| 5 | Structured JSON logging | P1 — production observability | [ ] |
-| 6 | Centralized config (`BaseSettings`) | P1 — operational safety | [ ] |
-| 7 | Bounded queue with backpressure in batcher | P1 — OOM risk | [ ] |
-| 8 | Threshold from model registry, not env var | P2 — model/config coupling | [ ] |
-| 9 | Implement evaluation pipeline | P2 — no quality gate | [ ] |
-| 10 | Fix `conftest.py` mock contract | P2 — false test confidence | [x] |
-| 11 | K8s-native Prometheus scrape (Phase 3/4) | P3 — deferred until K8s exists | [ ] |
-| 12 | `pyproject.toml` for optimizer pipeline | P2 — dependency isolation | [x] |
-| 13 | Class imbalance in retrain dataset | P1 — model collapses after first retrain | [ ] |
+| 1 | Dockerfile for classifier | P0 — CD is broken | ✓ done |
+| 2 | Remove `torch`/`optimum` from classifier deps | P0 — image size | ✓ done |
+| 3 | Tests for classifier service | P0 — no safety net | ✓ done |
+| 4 | Liveness / readiness probe split | P1 — K8s stability | open |
+| 5 | Structured JSON logging | P1 — production observability | open |
+| 6 | Centralized config (`BaseSettings`) | P1 — operational safety | open |
+| 7 | Bounded queue with backpressure in batcher | P1 — OOM risk | open |
+| 8 | Threshold from model registry, not env var | P2 — model/config coupling | open |
+| 9 | Implement evaluation pipeline | P2 — no quality gate | open |
+| 10 | Fix `conftest.py` mock contract | P2 — false test confidence | ✓ done |
+| 11 | K8s-native Prometheus scrape (deferred to Phase 5) | P3 — deferred until classifier is in cluster | open |
+| 12 | `pyproject.toml` for optimizer pipeline | P2 — dependency isolation | ✓ done |
+| 13 | Class imbalance in retrain dataset | P1 — model collapses after first retrain | open |
