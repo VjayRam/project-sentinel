@@ -22,6 +22,23 @@ info() { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
+# Wait until a TCP port accepts connections, up to ~15 seconds.
+# Prints a clear success or failure line — errors go to the log file named
+# after the service so you know exactly where to look.
+wait_for_port() {
+    local label=$1 port=$2 log_name=$3
+    local i=0
+    while ! timeout 1 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$port" 2>/dev/null; do
+        i=$((i + 1))   # arithmetic assignment never exits under set -e (unlike ((i++)) which returns 0 when i=0)
+        if [[ $i -ge 15 ]]; then
+            warn "${label} did not open on port ${port} — check $PF_DIR/${log_name}.log"
+            return 1
+        fi
+        sleep 1
+    done
+    info "${label} ready on localhost:${port}"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLUSTER="sentinel"
@@ -112,26 +129,36 @@ done
 sleep 1
 
 # ── open port-forwards ────────────────────────────────────────────────────────
+# --address=0.0.0.0 binds the tunnel to all interfaces, not just 127.0.0.1.
+# This is required on WSL2 so that the Windows browser can reach the services
+# via localhost — without it, the relay from Windows to WSL2 doesn't connect.
 info "Opening port-forwards..."
 
-kubectl port-forward -n sentinel-data svc/postgresql 5432:5432 \
+kubectl port-forward --address=0.0.0.0 -n sentinel-data svc/postgresql 5432:5432 \
     &>"$PF_DIR/postgres.log" & echo $! >"$PF_DIR/postgres.pid"
 
-kubectl port-forward -n sentinel-data svc/mongodb 27017:27017 \
+kubectl port-forward --address=0.0.0.0 -n sentinel-data svc/mongodb 27017:27017 \
     &>"$PF_DIR/mongo.log" & echo $! >"$PF_DIR/mongo.pid"
 
-kubectl port-forward -n sentinel-data svc/minio 9000:9000 9001:9001 \
+kubectl port-forward --address=0.0.0.0 -n sentinel-data svc/minio 9000:9000 9001:9001 \
     &>"$PF_DIR/minio.log" & echo $! >"$PF_DIR/minio.pid"
 
-kubectl port-forward -n sentinel-monitoring svc/prometheus 9090:9090 \
+kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/prometheus 9090:9090 \
     &>"$PF_DIR/prometheus.log" & echo $! >"$PF_DIR/prometheus.pid"
 
-kubectl port-forward -n sentinel-monitoring svc/grafana 3000:3000 \
+kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/grafana 3000:3000 \
     &>"$PF_DIR/grafana.log" & echo $! >"$PF_DIR/grafana.pid"
 
-sleep 2   # allow tunnels to initialise before classifier connects to Postgres
+# Verify each tunnel actually opened — prints a clear success or failure line.
+# Errors are in $PF_DIR/*.log so the user knows exactly where to look.
+wait_for_port "PostgreSQL"  5432  postgres
+wait_for_port "MongoDB"     27017 mongo
+wait_for_port "MinIO"       9000  minio
+wait_for_port "Prometheus"  9090  prometheus
+wait_for_port "Grafana"     3000  grafana
 
-# ── classifier ────────────────────────────────────────────────────────────────
+# ── classifier ─────────────────────────────────────────────────────────────────
+
 export DATABASE_URL="postgresql://sentinel:${PG_PASSWORD}@localhost:5432/sentinel"
 export MINIO_ENDPOINT="http://localhost:9000"
 export MINIO_ACCESS_KEY="sentinel"

@@ -16,7 +16,8 @@ RUN uv venv /app/.venv && \
         "onnxruntime>=1.27.0" \
         "prometheus-client>=0.21" \
         "pydantic>=2.10" \
-        "asyncpg>=0.29"
+        "asyncpg>=0.29" \
+        "boto3>=1.35"
 
 # ── Stage 2: runtime image ───────────────────────────────────────────────────
 FROM python:3.12-slim
