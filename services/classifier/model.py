@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -25,9 +26,18 @@ def _project_root() -> Path:
     return here
 
 
-def _resolve_model_dir() -> Path:
+def _resolve_model_dir() -> tuple[Path, str, str | None]:
+    """Returns (model_dir, deployed_at, source_model_id).
+
+    source_model_id is the HuggingFace model ID from the optimizer report, or
+    None when the path is supplied explicitly via MODEL_PATH.
+    """
     if model_path := os.environ.get("MODEL_PATH"):
-        return Path(model_path)
+        p = Path(model_path)
+        onnx_file = next(p.glob("*.onnx"), None)
+        mtime = onnx_file.stat().st_mtime if onnx_file else None
+        ts = datetime.fromtimestamp(mtime, tz=timezone.utc) if mtime else datetime.now(timezone.utc)
+        return p, ts.strftime("%Y%m%dT%H%M%SZ"), None
 
     log_root = _project_root() / "logs" / "optimizer"
     if not log_root.exists():
@@ -44,12 +54,19 @@ def _resolve_model_dir() -> Path:
     report = json.loads(reports[0].read_text())
     model_dir = _project_root() / report["stages"]["quantize"]["output"]
     logger.info("Auto-selected model from run %s", report["run_id"])
-    return model_dir
+
+    try:
+        ts = datetime.fromisoformat(report["completed_at"])
+        deployed_at = ts.strftime("%Y%m%dT%H%M%SZ")
+    except (KeyError, ValueError):
+        deployed_at = "unknown"
+
+    return model_dir, deployed_at, report.get("model_id")
 
 
 class Classifier:
     def __init__(self) -> None:
-        model_dir = _resolve_model_dir()
+        model_dir, deployed_at, source_model_id = _resolve_model_dir()
 
         model_file = next(model_dir.glob("*.onnx"), None)
         if model_file is None:
@@ -69,11 +86,14 @@ class Classifier:
         self._input_names = {inp.name for inp in self._session.get_inputs()}
 
         config = json.loads((model_dir / "config.json").read_text())
-        self.model_id = config.get("_name_or_path", str(model_dir))
+        self.model_id = source_model_id or config.get("_name_or_path") or str(model_dir)
+        model_name = self.model_id.split("/")[-1]
+        self.model_version = f"{model_name}-{deployed_at}"
 
         logger.info(
-            "Loaded %s | file=%s | intra_threads=%d | threshold=%.2f",
+            "Loaded %s | version=%s | file=%s | intra_threads=%d | threshold=%.2f",
             self.model_id,
+            self.model_version,
             model_file.name,
             _INTRA_THREADS,
             _THRESHOLD,

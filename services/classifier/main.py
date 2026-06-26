@@ -1,6 +1,7 @@
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from prometheus_client import make_asgi_app
@@ -56,7 +57,12 @@ async def classify(request: ClassifyRequest) -> ClassifyResponse:
     REQUEST_COUNT.labels(endpoint="classify", label=result["label"]).inc()
     REQUEST_LATENCY.labels(endpoint="classify").observe(latency_ms / 1000)
 
-    return ClassifyResponse(latency_ms=latency_ms, **result)
+    return ClassifyResponse(
+        latency_ms=latency_ms,
+        model_version=_classifier.model_version,
+        inference_at=datetime.now(timezone.utc).isoformat(),
+        **result,
+    )
 
 
 @app.post("/classify/batch", response_model=BatchClassifyResponse)
@@ -74,4 +80,6 @@ def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse:
         results=[ClassifyResult(**r) for r in results],
         latency_ms=latency_ms,
         batch_size=len(request.texts),
+        model_version=_classifier.model_version,
+        inference_at=datetime.now(timezone.utc).isoformat(),
     )

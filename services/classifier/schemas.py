@@ -14,6 +14,8 @@ class ClassifyResult(BaseModel):
 
 class ClassifyResponse(ClassifyResult):
     latency_ms: float
+    model_version: str
+    inference_at: str
 
 
 class BatchClassifyRequest(BaseModel):
@@ -24,3 +26,5 @@ class BatchClassifyResponse(BaseModel):
     results: list[ClassifyResult]
     latency_ms: float
     batch_size: int
+    model_version: str
+    inference_at: str
