@@ -12,6 +12,7 @@ build/
 *.onnx
 models/
 data/
+logs/
 *.parquet
 *.csv
 .DS_Store
