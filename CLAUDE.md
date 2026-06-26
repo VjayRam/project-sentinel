@@ -99,6 +99,29 @@ k3d or Minikube. Use the `local-path` StorageClass for PVCs.
 
 `model_registry` PostgreSQL table controls which model version each classifier pod loads. Airflow's `retrain_dag` promotes a new model by updating the table, then runs `kubectl rollout restart deployment/classifier`. Each new pod queries the table on startup and downloads the active ONNX model from MinIO.
 
+## Target Production Folder Structure (Evolve Toward This)
+
+Current phases use `pipelines/optimizer/`, `pipelines/evaluate/` etc. as scaffolding. The end-state production structure organizes by **deployment boundary**, not by "it's ML stuff":
+
+```
+sentinel/
+  services/
+    classifier/        ← long-running FastAPI server (K8s Deployment)
+    stream-processor/  ← long-running Kafka consumer (K8s Deployment)
+  pipelines/
+    optimizer/         ← one-shot ONNX pipeline (K8s Job)
+    evaluate/          ← accuracy + latency benchmarks (K8s Job)
+    retrain/           ← fine-tuning scripts, called by Airflow
+    drift/             ← PySpark PSI/JSD jobs (spark-submit, own pyproject.toml)
+  dags/                ← Airflow DAG definitions (orchestrates pipelines/)
+  datasets/            ← shared data loading utilities
+  infra/               ← Terraform + Helm charts
+```
+
+Key principle: every folder under `pipelines/` eventually becomes a containerized job with its own Dockerfile and entry point. The distinction between "service" (always running) and "job" (runs to completion) maps directly to K8s `Deployment` vs `Job`. `drift/` gets its own `pyproject.toml` because PySpark manages its own Python environment via `spark-submit --py-files`.
+
+During learning phases, `pipelines/` scripts run locally. Don't force the K8s Job wiring until Phase 6-7.
+
 ## Common Interview Points (Do Not Lose These in Refactors)
 
 - Classifier uses sync route for blocking C calls — not async
