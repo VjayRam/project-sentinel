@@ -4,12 +4,12 @@ on:
   push:
     branches: [master]
     paths:
-      - "services/ml/**"
+      - "services/classifier/**"
       - ".github/workflows/cd.yml"
 
 jobs:
-  build-ml:
-    name: Build & push ML service
+  build-classifier:
+    name: Build & push classifier service
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -32,7 +32,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}/ml
+          images: ghcr.io/${{ github.repository }}/classifier
           tags: |
             type=sha,prefix=sha-
             type=raw,value=latest
@@ -40,7 +40,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./services/ml
+          context: ./services/classifier
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
