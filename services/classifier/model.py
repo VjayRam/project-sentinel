@@ -71,8 +71,16 @@ class Classifier:
             model_dir = Path(model_dir)
             onnx_file = next(model_dir.glob("*.onnx"), None)
             mtime = onnx_file.stat().st_mtime if onnx_file else None
-            ts = datetime.fromtimestamp(mtime, tz=timezone.utc) if mtime else datetime.now(timezone.utc)
-            resolved_dir, deployed_at, source_model_id = model_dir, ts.strftime("%Y%m%dT%H%M%SZ"), None
+            ts = (
+                datetime.fromtimestamp(mtime, tz=timezone.utc)
+                if mtime
+                else datetime.now(timezone.utc)
+            )
+            resolved_dir, deployed_at, source_model_id = (
+                model_dir,
+                ts.strftime("%Y%m%dT%H%M%SZ"),
+                None,
+            )
         else:
             resolved_dir, deployed_at, source_model_id = _resolve_model_dir()
         model_dir = resolved_dir

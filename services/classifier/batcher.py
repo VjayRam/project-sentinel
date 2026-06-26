@@ -69,9 +69,7 @@ class DynamicBatcher:
             # Run blocking ORT call off the event loop
             loop = asyncio.get_running_loop()
             try:
-                results = await loop.run_in_executor(
-                    None, self._predict, [p.text for p in batch]
-                )
+                results = await loop.run_in_executor(None, self._predict, [p.text for p in batch])
                 for pending, result in zip(batch, results):
                     if not pending.future.done():
                         pending.future.set_result(result)

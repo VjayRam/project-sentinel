@@ -42,7 +42,7 @@ def run(model_id: str, output_dir: str, log_dir: str = "logs", opset: int = 17) 
     # output_dir_name is the subdirectory written by that stage — also used as
     # the MinIO prefix so the bucket mirrors the local artifact tree exactly.
     stages = [
-        ("export",   lambda: export(model_id, run_artifacts / "fp32", opset=opset), "fp32"),
+        ("export", lambda: export(model_id, run_artifacts / "fp32", opset=opset), "fp32"),
         ("optimize", lambda: optimize(run_artifacts / "fp32", run_artifacts / "o2"), "o2"),
         ("quantize", lambda: quantize(run_artifacts / "o2", run_artifacts / "int8"), "int8"),
     ]
@@ -81,9 +81,7 @@ def run(model_id: str, output_dir: str, log_dir: str = "logs", opset: int = 17) 
         # MinIO was unreachable for at least one stage — fall back to the local
         # int8 path so the registry still records this run.
         model_path = str(run_artifacts / "int8")
-        logger.warning(
-            "MinIO unavailable — registering local path as fallback: %s", model_path
-        )
+        logger.warning("MinIO unavailable — registering local path as fallback: %s", model_path)
         t0 = time.perf_counter()
         register_model(run_id, model_path)
         report["stages"]["register"] = {

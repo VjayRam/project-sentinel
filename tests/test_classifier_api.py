@@ -69,7 +69,13 @@ def test_classify_missing_text_returns_422(client):
 def test_batch_response_shape(client):
     r = client.post("/classify/batch", json={"texts": ["hello", "world"]})
     assert r.status_code == 200
-    assert set(r.json().keys()) == {"results", "latency_ms", "batch_size", "model_version", "inference_at"}
+    assert set(r.json().keys()) == {
+        "results",
+        "latency_ms",
+        "batch_size",
+        "model_version",
+        "inference_at",
+    }
 
 
 def test_batch_result_count_matches_input(client):

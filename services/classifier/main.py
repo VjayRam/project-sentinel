@@ -6,14 +6,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
-from prometheus_client import make_asgi_app
-
 import db as _db
 from batcher import DynamicBatcher
 from download import download_model
+from fastapi import FastAPI
 from metrics import BATCH_SIZE, REQUEST_COUNT, REQUEST_LATENCY, attach_log_handler
 from model import Classifier
+from prometheus_client import make_asgi_app
 from schemas import (
     BatchClassifyRequest,
     BatchClassifyResponse,
@@ -53,9 +52,7 @@ async def lifespan(app: FastAPI):
                 # download_model is blocking boto3 I/O — offload to a thread so
                 # the event loop stays responsive during the transfer.
                 loop = asyncio.get_running_loop()
-                model_dir = await loop.run_in_executor(
-                    None, download_model, active["model_path"]
-                )
+                model_dir = await loop.run_in_executor(None, download_model, active["model_path"])
                 if model_dir is None:
                     logger.warning(
                         "Could not resolve model from registry | version=%s | path=%s"
@@ -108,9 +105,18 @@ def health() -> dict:
     return {"status": "ok", "model": _classifier.model_id if _classifier else None}
 
 
-async def _persist_single(text: str, label: str, score: float, model_version: str, latency_ms: float, inference_at: datetime) -> None:
+async def _persist_single(
+    text: str,
+    label: str,
+    score: float,
+    model_version: str,
+    latency_ms: float,
+    inference_at: datetime,
+) -> None:
     try:
-        await _db.write_classification(_pool, text, label, score, model_version, latency_ms, inference_at)
+        await _db.write_classification(
+            _pool, text, label, score, model_version, latency_ms, inference_at
+        )
     except Exception:
         logger.exception("Failed to persist classification")
 
@@ -133,10 +139,16 @@ async def classify(request: ClassifyRequest) -> ClassifyResponse:
     REQUEST_LATENCY.labels(endpoint="classify").observe(latency_ms / 1000)
 
     if _pool:
-        asyncio.create_task(_persist_single(
-            request.text, result["label"], result["score"],
-            _classifier.model_version, latency_ms, inference_at,
-        ))
+        asyncio.create_task(
+            _persist_single(
+                request.text,
+                result["label"],
+                result["score"],
+                _classifier.model_version,
+                latency_ms,
+                inference_at,
+            )
+        )
 
     return ClassifyResponse(
         latency_ms=latency_ms,
