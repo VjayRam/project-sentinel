@@ -2,14 +2,10 @@ import pytest
 
 
 @pytest.fixture
-def mock_classifier():
-    """Stub for the ONNX/transformers classifier.
+def mock_predict():
+    """Replaces Classifier.predict in tests — returns real output shape without loading weights."""
 
-    Tests import this fixture instead of loading the real model,
-    so CI never needs torch or model weights.
-    """
+    def _predict(texts: list[str]) -> list[dict]:
+        return [{"label": "safe", "score": 0.12}] * len(texts)
 
-    def _classify(text: str):
-        return [{"label": "LABEL_0", "score": 0.95}]
-
-    return _classify
+    return _predict

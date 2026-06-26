@@ -1,4 +1,17 @@
 services:
+  classifier:
+    build: ./services/classifier
+    container_name: sentinel-classifier
+    ports:
+      - "8000:8000"
+    volumes:
+      # Models and logs are mounted so the auto-detect in _resolve_model_dir() works.
+      # uv.lock is mounted so _project_root() can find the workspace root inside the container.
+      - ./models:/app/models:ro
+      - ./logs:/app/logs:ro
+      - ./uv.lock:/app/uv.lock:ro
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v3.4.1
     container_name: sentinel-prometheus
@@ -13,8 +26,8 @@ services:
       - "--storage.tsdb.retention.time=7d"
       - "--web.enable-lifecycle"
       - "--web.enable-remote-write-receiver"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    depends_on:
+      - classifier
     restart: unless-stopped
 
   grafana:

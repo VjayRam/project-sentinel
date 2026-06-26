@@ -10,6 +10,7 @@ resolution-markers = [
 members = [
     "sentinel",
     "sentinel-classifier",
+    "sentinel-optimizer",
 ]
 
 [[package]]
@@ -1233,10 +1234,8 @@ source = { virtual = "services/classifier" }
 dependencies = [
     { name = "fastapi" },
     { name = "onnxruntime" },
-    { name = "optimum", extra = ["onnxruntime"] },
     { name = "prometheus-client" },
     { name = "pydantic" },
-    { name = "torch" },
     { name = "transformers" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -1245,12 +1244,31 @@ dependencies = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "onnxruntime", specifier = ">=1.27.0" },
-    { name = "optimum", extras = ["onnxruntime"], specifier = ">=2.1.0" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "pydantic", specifier = ">=2.10" },
-    { name = "torch", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cu130" },
     { name = "transformers", specifier = ">=4.48" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
+]
+
+[[package]]
+name = "sentinel-optimizer"
+version = "0.1.0"
+source = { virtual = "pipelines/optimizer" }
+dependencies = [
+    { name = "onnx" },
+    { name = "onnxruntime" },
+    { name = "optimum", extra = ["onnxruntime"] },
+    { name = "torch" },
+    { name = "transformers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "onnx", specifier = ">=1.17" },
+    { name = "onnxruntime", specifier = ">=1.27.0" },
+    { name = "optimum", extras = ["onnxruntime"], specifier = ">=2.1.0" },
+    { name = "torch", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "transformers", specifier = ">=4.48" },
 ]
 
 [[package]]

@@ -602,15 +602,15 @@ Work through these in order — each one unblocks the next.
 
 | # | Issue | Priority | Status |
 |---|-------|----------|--------|
-| 1 | Dockerfile for classifier | P0 — CD is broken | [ ] |
-| 2 | Remove `torch`/`optimum` from classifier deps | P0 — image size | [ ] |
-| 3 | Tests for classifier service | P0 — no safety net | [ ] |
+| 1 | Dockerfile for classifier | P0 — CD is broken | [x] |
+| 2 | Remove `torch`/`optimum` from classifier deps | P0 — image size | [x] |
+| 3 | Tests for classifier service | P0 — no safety net | [x] |
 | 4 | Liveness / readiness probe split | P1 — K8s stability | [ ] |
 | 5 | Structured JSON logging | P1 — production observability | [ ] |
 | 6 | Centralized config (`BaseSettings`) | P1 — operational safety | [ ] |
 | 7 | Bounded queue with backpressure in batcher | P1 — OOM risk | [ ] |
 | 8 | Threshold from model registry, not env var | P2 — model/config coupling | [ ] |
 | 9 | Implement evaluation pipeline | P2 — no quality gate | [ ] |
-| 10 | Fix `conftest.py` mock contract | P2 — false test confidence | [ ] |
+| 10 | Fix `conftest.py` mock contract | P2 — false test confidence | [x] |
 | 11 | K8s-native Prometheus scrape (Phase 3/4) | P3 — deferred until K8s exists | [ ] |
-| 12 | `pyproject.toml` for optimizer pipeline | P2 — dependency isolation | [ ] |
+| 12 | `pyproject.toml` for optimizer pipeline | P2 — dependency isolation | [x] |
