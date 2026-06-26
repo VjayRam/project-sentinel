@@ -1367,6 +1367,9 @@ wheels = [
 name = "sentinel"
 version = "0.1.0"
 source = { virtual = "." }
+dependencies = [
+    { name = "psycopg" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1377,6 +1380,7 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "psycopg", specifier = ">=3.3.4" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1392,6 +1396,7 @@ version = "0.1.0"
 source = { virtual = "services/classifier" }
 dependencies = [
     { name = "asyncpg" },
+    { name = "boto3" },
     { name = "fastapi" },
     { name = "onnxruntime" },
     { name = "prometheus-client" },
@@ -1403,6 +1408,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.29" },
+    { name = "boto3", specifier = ">=1.35" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "onnxruntime", specifier = ">=1.27.0" },
     { name = "prometheus-client", specifier = ">=0.21" },

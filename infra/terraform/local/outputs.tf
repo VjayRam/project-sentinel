@@ -71,3 +71,13 @@ output "minio_console_port_forward" {
   description = "Command to open the MinIO web console in your browser (http://localhost:9001)"
   value       = "kubectl port-forward -n sentinel-data svc/minio 9001:9001"
 }
+
+output "prometheus_port_forward" {
+  description = "Command to reach the Prometheus UI from your local machine (http://localhost:9090)"
+  value       = "kubectl port-forward -n sentinel-monitoring svc/prometheus 9090:9090"
+}
+
+output "grafana_port_forward" {
+  description = "Command to open Grafana in your browser (http://localhost:3000, admin/admin)"
+  value       = "kubectl port-forward -n sentinel-monitoring svc/grafana 3000:3000"
+}

@@ -615,3 +615,314 @@ resource "kubernetes_job_v1" "minio_init" {
     create = "3m"
   }
 }
+
+# ── Prometheus ────────────────────────────────────────────────────────────────
+# Scrapes /metrics from the classifier every 10s and stores time-series in its
+# local TSDB (7-day retention). Grafana reads from Prometheus as its datasource.
+# Uses a StatefulSet for the PVC — TSDB data must survive pod restarts.
+#
+# ConfigMap carries two keys:
+#   prometheus.yml        → /etc/prometheus/prometheus.yml
+#   classifier-rules.yml  → /etc/prometheus/rules/classifier.yml
+# sub_path mounts each key as a specific file so they land at different paths
+# without clobbering the rest of the directory.
+
+resource "kubernetes_config_map" "prometheus_config" {
+  metadata {
+    name      = "prometheus-config"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+  }
+
+  data = {
+    "prometheus.yml"       = file("${path.module}/../../prometheus/prometheus.yml")
+    "classifier-rules.yml" = file("${path.module}/../../prometheus/rules/classifier.yml")
+  }
+}
+
+resource "kubernetes_stateful_set" "prometheus" {
+  metadata {
+    name      = "prometheus"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+    labels    = { app = "prometheus" }
+  }
+
+  spec {
+    service_name = "prometheus"
+    replicas     = 1
+
+    selector {
+      match_labels = { app = "prometheus" }
+    }
+
+    template {
+      metadata {
+        labels = { app = "prometheus" }
+      }
+
+      spec {
+        # Prometheus image runs as uid 65534 (nobody). fs_group ensures the PVC
+        # is group-owned by 65534 so Prometheus can write to its TSDB.
+        security_context {
+          fs_group = 65534
+        }
+
+        container {
+          name  = "prometheus"
+          image = "prom/prometheus:v2.55.0"
+
+          args = [
+            "--config.file=/etc/prometheus/prometheus.yml",
+            "--storage.tsdb.path=/prometheus",
+            "--storage.tsdb.retention.time=7d",
+            # Enables POST /-/reload to hot-reload config without pod restart.
+            "--web.enable-lifecycle",
+          ]
+
+          port {
+            container_port = 9090
+          }
+
+          # Mount prometheus.yml as a single file via sub_path so the rest of
+          # /etc/prometheus/ is not replaced by the ConfigMap mount.
+          volume_mount {
+            name       = "config"
+            mount_path = "/etc/prometheus/prometheus.yml"
+            sub_path   = "prometheus.yml"
+          }
+          volume_mount {
+            name       = "config"
+            mount_path = "/etc/prometheus/rules/classifier.yml"
+            sub_path   = "classifier-rules.yml"
+          }
+          volume_mount {
+            name       = "data"
+            mount_path = "/prometheus"
+          }
+
+          resources {
+            requests = { cpu = "100m", memory = "256Mi" }
+            limits   = { cpu = "500m", memory = "512Mi" }
+          }
+
+          readiness_probe {
+            http_get {
+              path = "/-/ready"
+              port = 9090
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 5
+            failure_threshold     = 6
+          }
+
+          liveness_probe {
+            http_get {
+              path = "/-/healthy"
+              port = 9090
+            }
+            initial_delay_seconds = 30
+            period_seconds        = 15
+            failure_threshold     = 3
+          }
+        }
+
+        volume {
+          name = "config"
+          config_map {
+            name = kubernetes_config_map.prometheus_config.metadata[0].name
+          }
+        }
+      }
+    }
+
+    volume_claim_template {
+      metadata {
+        name = "data"
+      }
+      spec {
+        access_modes       = ["ReadWriteOnce"]
+        storage_class_name = "local-path"
+        resources {
+          requests = { storage = var.prometheus_storage_size }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+
+  timeouts {
+    create = "5m"
+    update = "5m"
+  }
+}
+
+resource "kubernetes_service" "prometheus" {
+  metadata {
+    name      = "prometheus"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+  }
+
+  spec {
+    selector = { app = "prometheus" }
+
+    port {
+      port        = 9090
+      target_port = 9090
+    }
+
+    type = "ClusterIP"
+  }
+}
+
+# ── Grafana ───────────────────────────────────────────────────────────────────
+# Visualisation layer on top of Prometheus. Uses a Deployment (not StatefulSet)
+# because Grafana's state is fully reproduced from provisioning ConfigMaps —
+# no PVC needed in local dev.
+#
+# Provisioning wires the Prometheus datasource automatically on first boot so
+# you don't need to click through the UI to add it.
+
+resource "kubernetes_secret" "grafana" {
+  metadata {
+    name      = "grafana-credentials"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+  }
+  data = {
+    admin-password = var.grafana_admin_password
+  }
+}
+
+resource "kubernetes_config_map" "grafana_datasources" {
+  metadata {
+    name      = "grafana-datasources"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+  }
+
+  data = {
+    "prometheus.yml" = file("${path.module}/../../grafana/provisioning/datasources/prometheus.yml")
+  }
+}
+
+resource "kubernetes_deployment" "grafana" {
+  metadata {
+    name      = "grafana"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+    labels    = { app = "grafana" }
+  }
+
+  spec {
+    replicas = 1
+
+    selector {
+      match_labels = { app = "grafana" }
+    }
+
+    template {
+      metadata {
+        labels = { app = "grafana" }
+      }
+
+      spec {
+        # Grafana image runs as uid 472. fs_group makes any mounted volumes
+        # group-writable by the grafana process.
+        security_context {
+          fs_group = 472
+        }
+
+        container {
+          name  = "grafana"
+          image = "grafana/grafana:11.3.0"
+
+          env {
+            name  = "GF_SECURITY_ADMIN_USER"
+            value = "admin"
+          }
+          env {
+            name = "GF_SECURITY_ADMIN_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.grafana.metadata[0].name
+                key  = "admin-password"
+              }
+            }
+          }
+          # Disable phone-home / update checks in local dev.
+          env {
+            name  = "GF_ANALYTICS_REPORTING_ENABLED"
+            value = "false"
+          }
+          env {
+            name  = "GF_ANALYTICS_CHECK_FOR_UPDATES"
+            value = "false"
+          }
+
+          port {
+            container_port = 3000
+          }
+
+          volume_mount {
+            name       = "datasources"
+            mount_path = "/etc/grafana/provisioning/datasources"
+          }
+
+          resources {
+            requests = { cpu = "100m", memory = "128Mi" }
+            limits   = { cpu = "200m", memory = "256Mi" }
+          }
+
+          readiness_probe {
+            http_get {
+              path = "/api/health"
+              port = 3000
+            }
+            initial_delay_seconds = 15
+            period_seconds        = 5
+            failure_threshold     = 6
+          }
+
+          liveness_probe {
+            http_get {
+              path = "/api/health"
+              port = 3000
+            }
+            initial_delay_seconds = 30
+            period_seconds        = 15
+            failure_threshold     = 3
+          }
+        }
+
+        volume {
+          name = "datasources"
+          config_map {
+            name = kubernetes_config_map.grafana_datasources.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+
+  timeouts {
+    create = "5m"
+    update = "5m"
+  }
+}
+
+resource "kubernetes_service" "grafana" {
+  metadata {
+    name      = "grafana"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+  }
+
+  spec {
+    selector = { app = "grafana" }
+
+    port {
+      port        = 3000
+      target_port = 3000
+    }
+
+    type = "ClusterIP"
+  }
+}

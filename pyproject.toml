@@ -2,7 +2,9 @@
 name = "sentinel"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "psycopg>=3.3.4",
+]
 
 [tool.uv.workspace]
 members = ["services/*", "pipelines/optimizer"]

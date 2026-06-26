@@ -17,6 +17,35 @@ async def close_pool(pool: asyncpg.Pool) -> None:
     logger.info("DB pool closed")
 
 
+async def get_active_model(pool: asyncpg.Pool) -> dict | None:
+    """Return the best available model from model_registry.
+
+    Prefers status='active' (Airflow-promoted). Falls back to the most recent
+    'staging' entry so local dev works without a full Airflow setup.
+    Returns None if the registry is empty.
+    """
+    row = await pool.fetchrow(
+        """
+        SELECT model_version, model_path, threshold
+        FROM model_registry
+        WHERE status IN ('active', 'staging')
+        ORDER BY
+            CASE status WHEN 'active' THEN 0 ELSE 1 END,
+            COALESCE(promoted_at, created_at) DESC
+        LIMIT 1
+        """
+    )
+    if row is None:
+        return None
+    result = dict(row)
+    logger.info(
+        "Registry model selected | version=%s | path=%s",
+        result["model_version"],
+        result["model_path"],
+    )
+    return result
+
+
 async def register_model(
     pool: asyncpg.Pool,
     model_version: str,

@@ -10,7 +10,7 @@ from pipelines.optimizer.export import export
 from pipelines.optimizer.optimize import optimize
 from pipelines.optimizer.quantize import quantize
 from pipelines.optimizer.registry import register_model
-from pipelines.optimizer.upload import upload_model
+from pipelines.optimizer.upload import upload_report, upload_stage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,47 +38,69 @@ def run(model_id: str, output_dir: str, log_dir: str = "logs", opset: int = 17) 
         "stages": {},
     }
 
+    # Each tuple: (stage_name, fn, output_dir_name)
+    # output_dir_name is the subdirectory written by that stage — also used as
+    # the MinIO prefix so the bucket mirrors the local artifact tree exactly.
     stages = [
-        ("export", lambda: export(model_id, run_artifacts / "fp32", opset=opset)),
-        ("optimize", lambda: optimize(run_artifacts / "fp32", run_artifacts / "o2")),
-        ("quantize", lambda: quantize(run_artifacts / "o2", run_artifacts / "int8")),
+        ("export",   lambda: export(model_id, run_artifacts / "fp32", opset=opset), "fp32"),
+        ("optimize", lambda: optimize(run_artifacts / "fp32", run_artifacts / "o2"), "o2"),
+        ("quantize", lambda: quantize(run_artifacts / "o2", run_artifacts / "int8"), "int8"),
     ]
 
-    for name, fn in stages:
+    minio_ok = True  # flips False on first upload failure; gates registration
+
+    for name, fn, dir_name in stages:
         logger.info("--- Stage: %s | run_id=%s ---", name, run_id)
         t0 = time.perf_counter()
         out = fn()
+
+        # Upload this stage to MinIO immediately after it completes.
+        # On failure, upload_stage logs a warning and returns None — we keep
+        # going so the local artifacts are always complete regardless.
+        minio_prefix = upload_stage(run_id, dir_name, run_artifacts / dir_name)
+        if minio_prefix is None:
+            minio_ok = False
+
         report["stages"][name] = {
             "duration_s": round(time.perf_counter() - t0, 2),
             "output": str(out),
+            "minio_path": minio_prefix,
         }
 
-    # Upload the final int8 artifact to MinIO.
-    # Separated from the stages loop because register needs the model_path
-    # that upload returns — the two steps are sequentially dependent.
-    logger.info("--- Stage: upload | run_id=%s ---", run_id)
-    t0 = time.perf_counter()
-    model_path = upload_model(run_id, run_artifacts / "int8")
-    report["stages"]["upload"] = {
-        "duration_s": round(time.perf_counter() - t0, 2),
-        "output": model_path,
-    }
-
-    # Register in model_registry as 'staging'. Promotion to 'active' happens
-    # via Airflow after evaluation passes — not here.
-    logger.info("--- Stage: register | run_id=%s ---", run_id)
-    t0 = time.perf_counter()
-    register_model(run_id, model_path)
-    report["stages"]["register"] = {
-        "duration_s": round(time.perf_counter() - t0, 2),
-        "output": f"version={run_id} status=staging",
-    }
+    # Determine model_path: MinIO key when available, local path as fallback.
+    if minio_ok:
+        model_path = f"models/{run_id}/int8/model_quantized.onnx"
+        logger.info("--- Stage: register | run_id=%s ---", run_id)
+        t0 = time.perf_counter()
+        register_model(run_id, model_path)
+        report["stages"]["register"] = {
+            "duration_s": round(time.perf_counter() - t0, 2),
+            "output": f"version={run_id} status=staging",
+        }
+    else:
+        # MinIO was unreachable for at least one stage — fall back to the local
+        # int8 path so the registry still records this run.
+        model_path = str(run_artifacts / "int8")
+        logger.warning(
+            "MinIO unavailable — registering local path as fallback: %s", model_path
+        )
+        t0 = time.perf_counter()
+        register_model(run_id, model_path)
+        report["stages"]["register"] = {
+            "duration_s": round(time.perf_counter() - t0, 2),
+            "output": f"version={run_id} status=staging (local fallback)",
+        }
 
     report["completed_at"] = datetime.now(timezone.utc).isoformat()
     report["model_path"] = model_path
 
     report_path = run_log / "report.json"
     report_path.write_text(json.dumps(report, indent=2))
+
+    # Upload the report to MinIO so it survives pod termination.
+    # Best-effort — a failure here does not fail the pipeline.
+    upload_report(run_id, report_path)
+
     logger.info("Pipeline complete | run_id=%s | model_path=%s", run_id, model_path)
     return report_path
 

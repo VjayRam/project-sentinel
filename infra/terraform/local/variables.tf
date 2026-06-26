@@ -55,3 +55,16 @@ variable "minio_storage_size" {
   type        = string
   default     = "5Gi"
 }
+
+variable "prometheus_storage_size" {
+  description = "PVC size for Prometheus TSDB (7-day retention)"
+  type        = string
+  default     = "5Gi"
+}
+
+variable "grafana_admin_password" {
+  description = "Grafana admin user password"
+  type        = string
+  sensitive   = true
+  default     = "admin"
+}

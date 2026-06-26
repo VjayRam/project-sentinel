@@ -65,8 +65,17 @@ def _resolve_model_dir() -> tuple[Path, str, str | None]:
 
 
 class Classifier:
-    def __init__(self) -> None:
-        model_dir, deployed_at, source_model_id = _resolve_model_dir()
+    def __init__(self, model_dir: Path | None = None) -> None:
+        if model_dir is not None:
+            # Caller (lifespan) already resolved the directory — skip local discovery.
+            model_dir = Path(model_dir)
+            onnx_file = next(model_dir.glob("*.onnx"), None)
+            mtime = onnx_file.stat().st_mtime if onnx_file else None
+            ts = datetime.fromtimestamp(mtime, tz=timezone.utc) if mtime else datetime.now(timezone.utc)
+            resolved_dir, deployed_at, source_model_id = model_dir, ts.strftime("%Y%m%dT%H%M%SZ"), None
+        else:
+            resolved_dir, deployed_at, source_model_id = _resolve_model_dir()
+        model_dir = resolved_dir
 
         model_file = next(model_dir.glob("*.onnx"), None)
         if model_file is None:

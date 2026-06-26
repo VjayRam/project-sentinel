@@ -11,6 +11,7 @@ build/
 models/
 data/
 logs/
+artifacts/
 *.parquet
 *.csv
 .DS_Store

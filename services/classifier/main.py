@@ -4,12 +4,14 @@ import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import FastAPI
 from prometheus_client import make_asgi_app
 
 import db as _db
 from batcher import DynamicBatcher
+from download import download_model
 from metrics import BATCH_SIZE, REQUEST_COUNT, REQUEST_LATENCY, attach_log_handler
 from model import Classifier
 from schemas import (
@@ -36,15 +38,50 @@ _pool = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _classifier, _batcher, _pool
-    _classifier = Classifier()
+
+    # ── 1. Connect to DB and resolve the active model from the registry ────────
+    # The registry is the source of truth for which model version to serve.
+    # Open the pool first so we can query it before loading the model.
+    model_dir: Path | None = None
+    dsn = os.environ.get("DATABASE_URL")
+
+    if dsn:
+        try:
+            _pool = await _db.init_pool(dsn)
+            active = await _db.get_active_model(_pool)
+            if active:
+                # download_model is blocking boto3 I/O — offload to a thread so
+                # the event loop stays responsive during the transfer.
+                loop = asyncio.get_running_loop()
+                model_dir = await loop.run_in_executor(
+                    None, download_model, active["model_path"]
+                )
+                if model_dir is None:
+                    logger.warning(
+                        "Could not resolve model from registry | version=%s | path=%s"
+                        " — falling back to local model discovery",
+                        active["model_version"],
+                        active["model_path"],
+                    )
+            else:
+                logger.info("Registry empty — using local model discovery")
+        except Exception:
+            logger.exception("DB init failed — running without persistence")
+            _pool = None
+    else:
+        logger.warning("DATABASE_URL not set — classifications will not be persisted")
+
+    # ── 2. Load the classifier ─────────────────────────────────────────────────
+    # model_dir=None falls through to MODEL_PATH env var, then logs/optimizer/.
+    _classifier = Classifier(model_dir=model_dir)
     _classifier.warmup()
     _batcher = DynamicBatcher(_classifier.predict)
     _batcher.start()
 
-    dsn = os.environ.get("DATABASE_URL")
-    if dsn:
+    # ── 3. Record this model version in the registry (idempotent) ─────────────
+    # ON CONFLICT DO NOTHING: first pod registers it, subsequent pods skip.
+    if _pool:
         try:
-            _pool = await _db.init_pool(dsn)
             await _db.register_model(
                 _pool,
                 _classifier.model_version,
@@ -52,10 +89,7 @@ async def lifespan(app: FastAPI):
                 _classifier.threshold,
             )
         except Exception:
-            logger.exception("DB init failed — running without persistence")
-            _pool = None
-    else:
-        logger.warning("DATABASE_URL not set — classifications will not be persisted")
+            logger.exception("Failed to register model version in registry")
 
     yield
 
