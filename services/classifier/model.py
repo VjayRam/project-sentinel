@@ -89,6 +89,8 @@ class Classifier:
         self.model_id = source_model_id or config.get("_name_or_path") or str(model_dir)
         model_name = self.model_id.split("/")[-1]
         self.model_version = f"{model_name}-{deployed_at}"
+        self.threshold = _THRESHOLD
+        self.model_path = str(model_dir)
 
         logger.info(
             "Loaded %s | version=%s | file=%s | intra_threads=%d | threshold=%.2f",

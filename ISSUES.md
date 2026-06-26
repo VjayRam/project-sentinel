@@ -596,6 +596,60 @@ Dependency isolation between services and pipelines is not organizational prefer
 
 ---
 
+## 13. Retraining on `flagged_content` alone causes class imbalance
+
+**Files:** `pipelines/retrain/` (Phase 7), stream processor (Phase 5)
+**Severity:** Model quality — silent accuracy collapse after first retrain
+
+### What's wrong
+
+`flagged_content` in MongoDB stores only `harm` predictions. If the retrain pipeline trains exclusively on this collection, the dataset has a single label. A binary classifier trained on one class will collapse — it learns to predict `harm` for every input regardless of content, achieving 100% recall and 0% precision.
+
+Even with both classes stored, MongoDB will accumulate far more harmful samples than safe ones if the harm rate is low (e.g. 5% of traffic) — the ratio skews badly over time.
+
+### What the fix looks like
+
+**Two changes that must both be in place:**
+
+**1. Stream processor samples safe content into MongoDB**
+
+When the stream processor (Phase 5) writes to MongoDB, it uses asymmetric sampling:
+
+```python
+SAFE_SAMPLE_RATE = float(os.environ.get("SAFE_SAMPLE_RATE", "0.1"))
+
+if result["label"] == "harm":
+    mongo.flagged_content.insert_one(doc)   # 100% of harm
+elif random.random() < SAFE_SAMPLE_RATE:
+    mongo.flagged_content.insert_one(doc)   # ~10% of safe
+```
+
+If traffic is 5% harmful, sampling 10% of safe gives a collection that is roughly 33% harm / 67% safe — far better than 100% harm. Tune `SAFE_SAMPLE_RATE` so the resulting ratio stays within 20/80 worst-case.
+
+**2. Retrain pipeline mixes `flagged_content` with the original training dataset**
+
+The Airflow `retrain_dag` (Phase 7) must never train exclusively on the MongoDB collection. The retrain script combines:
+
+```python
+# Load original balanced dataset from HuggingFace (or MinIO archive)
+original = load_dataset("VijayRam1812/content-classifier-roberta-dataset")
+
+# Load new samples accumulated since last retrain
+new_samples = mongo.flagged_content.find({"ts": {"$gt": last_retrain_ts}})
+
+# Combine: original provides balance, new samples teach new patterns
+combined = concat_datasets([original, new_samples_as_dataset])
+trainer.train(combined)
+```
+
+The original dataset is the stable base. `flagged_content` is augmentation, not a replacement. The ratio should be roughly 80% original / 20% new samples, adjustable by the number of new examples available.
+
+### Why it matters
+
+The first retrain after accumulating enough harmful examples will silently destroy model quality if this isn't handled. PSI > 0.2 triggers the retrain, the retrain produces a harm-biased model, the model gets promoted, and the classifier starts flagging everything as harmful — including safe content. This is worse than no retraining at all. The fix must be in place before Phase 7 is built.
+
+---
+
 ## Status tracker
 
 Work through these in order — each one unblocks the next.
@@ -614,3 +668,4 @@ Work through these in order — each one unblocks the next.
 | 10 | Fix `conftest.py` mock contract | P2 — false test confidence | [x] |
 | 11 | K8s-native Prometheus scrape (Phase 3/4) | P3 — deferred until K8s exists | [ ] |
 | 12 | `pyproject.toml` for optimizer pipeline | P2 — dependency isolation | [x] |
+| 13 | Class imbalance in retrain dataset | P1 — model collapses after first retrain | [ ] |

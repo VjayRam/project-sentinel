@@ -4,6 +4,12 @@ services:
     container_name: sentinel-classifier
     ports:
       - "8000:8000"
+    environment:
+      # Port-forward must be running: kubectl port-forward -n sentinel-data svc/postgresql 5432:5432
+      # Remove or comment out to run without DB persistence.
+      - DATABASE_URL=postgresql://sentinel:sentinel@host.docker.internal:5432/sentinel
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Models and logs are mounted so the auto-detect in _resolve_model_dir() works.
       # uv.lock is mounted so _project_root() can find the workspace root inside the container.

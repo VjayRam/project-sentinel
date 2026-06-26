@@ -15,7 +15,8 @@ RUN uv venv /app/.venv && \
         "transformers>=4.48" \
         "onnxruntime>=1.27.0" \
         "prometheus-client>=0.21" \
-        "pydantic>=2.10"
+        "pydantic>=2.10" \
+        "asyncpg>=0.29"
 
 # ── Stage 2: runtime image ───────────────────────────────────────────────────
 FROM python:3.12-slim
