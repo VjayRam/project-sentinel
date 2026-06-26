@@ -9,6 +9,8 @@ from pathlib import Path
 from pipelines.optimizer.export import export
 from pipelines.optimizer.optimize import optimize
 from pipelines.optimizer.quantize import quantize
+from pipelines.optimizer.registry import register_model
+from pipelines.optimizer.upload import upload_model
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,11 +53,33 @@ def run(model_id: str, output_dir: str, log_dir: str = "logs", opset: int = 17) 
             "output": str(out),
         }
 
+    # Upload the final int8 artifact to MinIO.
+    # Separated from the stages loop because register needs the model_path
+    # that upload returns — the two steps are sequentially dependent.
+    logger.info("--- Stage: upload | run_id=%s ---", run_id)
+    t0 = time.perf_counter()
+    model_path = upload_model(run_id, run_artifacts / "int8")
+    report["stages"]["upload"] = {
+        "duration_s": round(time.perf_counter() - t0, 2),
+        "output": model_path,
+    }
+
+    # Register in model_registry as 'staging'. Promotion to 'active' happens
+    # via Airflow after evaluation passes — not here.
+    logger.info("--- Stage: register | run_id=%s ---", run_id)
+    t0 = time.perf_counter()
+    register_model(run_id, model_path)
+    report["stages"]["register"] = {
+        "duration_s": round(time.perf_counter() - t0, 2),
+        "output": f"version={run_id} status=staging",
+    }
+
     report["completed_at"] = datetime.now(timezone.utc).isoformat()
+    report["model_path"] = model_path
 
     report_path = run_log / "report.json"
     report_path.write_text(json.dumps(report, indent=2))
-    logger.info("Pipeline complete | run_id=%s | report=%s", run_id, report_path)
+    logger.info("Pipeline complete | run_id=%s | model_path=%s", run_id, model_path)
     return report_path
 
 

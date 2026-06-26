@@ -36,3 +36,22 @@ variable "mongodb_storage_size" {
   type        = string
   default     = "2Gi"
 }
+
+variable "minio_root_user" {
+  description = "MinIO root username (S3 access key ID)"
+  type        = string
+  default     = "sentinel"
+}
+
+variable "minio_root_password" {
+  description = "MinIO root password (S3 secret access key, min 8 chars)"
+  type        = string
+  sensitive   = true
+  default     = "sentinel-minio"
+}
+
+variable "minio_storage_size" {
+  description = "PVC size for MinIO data"
+  type        = string
+  default     = "5Gi"
+}

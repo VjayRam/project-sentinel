@@ -8,4 +8,6 @@ dependencies = [
     "onnxruntime>=1.27.0",
     "transformers>=4.48",
     "onnx>=1.17",
+    "boto3>=1.35",
+    "psycopg[binary]>=3.2",
 ]

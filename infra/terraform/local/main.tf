@@ -376,3 +376,242 @@ resource "kubernetes_service" "mongodb" {
     type = "ClusterIP"
   }
 }
+
+# ── MinIO ─────────────────────────────────────────────────────────────────────
+# S3-compatible object storage for ONNX model artifacts.
+# model_registry.model_path values are MinIO object keys, e.g.:
+#   models/v1.0.0/model_quantized.onnx
+# Classifier pods download the active model from MinIO on startup.
+# Port 9000: S3-compatible API used by application code (boto3/aiobotocore).
+# Port 9001: web console for inspecting buckets during local dev.
+# Uses official minio/minio image (Docker Hub, free).
+# To update the image: check minio/minio on Docker Hub for the latest RELEASE tag.
+
+resource "kubernetes_secret" "minio" {
+  metadata {
+    name      = "minio-credentials"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+  }
+  data = {
+    root-user     = var.minio_root_user
+    root-password = var.minio_root_password
+  }
+}
+
+resource "kubernetes_stateful_set" "minio" {
+  metadata {
+    name      = "minio"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+    labels    = { app = "minio" }
+  }
+
+  spec {
+    service_name = "minio"
+    replicas     = 1
+
+    selector {
+      match_labels = { app = "minio" }
+    }
+
+    template {
+      metadata {
+        labels = { app = "minio" }
+      }
+
+      spec {
+        container {
+          name  = "minio"
+          image = "minio/minio:RELEASE.2024-11-07T00-52-20Z"
+
+          # "server /data" starts MinIO in single-node mode.
+          # --console-address pins the console to port 9001 so it doesn't
+          # pick a random port, making the Service port mapping deterministic.
+          args = ["server", "/data", "--console-address", ":9001"]
+
+          env {
+            name = "MINIO_ROOT_USER"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.minio.metadata[0].name
+                key  = "root-user"
+              }
+            }
+          }
+          env {
+            name = "MINIO_ROOT_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.minio.metadata[0].name
+                key  = "root-password"
+              }
+            }
+          }
+
+          port {
+            name           = "api"
+            container_port = 9000
+          }
+          port {
+            name           = "console"
+            container_port = 9001
+          }
+
+          volume_mount {
+            name       = "data"
+            mount_path = "/data"
+          }
+
+          resources {
+            requests = { cpu = "100m", memory = "256Mi" }
+            limits   = { cpu = "500m", memory = "512Mi" }
+          }
+
+          # /minio/health/ready returns 200 only when MinIO is accepting S3 requests.
+          readiness_probe {
+            http_get {
+              path = "/minio/health/ready"
+              port = 9000
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 5
+            failure_threshold     = 6
+          }
+
+          # /minio/health/live returns 200 as long as the process is alive.
+          liveness_probe {
+            http_get {
+              path = "/minio/health/live"
+              port = 9000
+            }
+            initial_delay_seconds = 30
+            period_seconds        = 20
+            failure_threshold     = 3
+          }
+        }
+      }
+    }
+
+    volume_claim_template {
+      metadata {
+        name = "data"
+      }
+      spec {
+        access_modes       = ["ReadWriteOnce"]
+        storage_class_name = "local-path"
+        resources {
+          requests = { storage = var.minio_storage_size }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+
+  timeouts {
+    create = "5m"
+    update = "5m"
+  }
+}
+
+resource "kubernetes_service" "minio" {
+  metadata {
+    name      = "minio"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+  }
+
+  spec {
+    selector = { app = "minio" }
+
+    port {
+      name        = "api"
+      port        = 9000
+      target_port = 9000
+    }
+
+    port {
+      name        = "console"
+      port        = 9001
+      target_port = 9001
+    }
+
+    type = "ClusterIP"
+  }
+}
+
+# ── MinIO bucket init ──────────────────────────────────────────────────────────
+# One-shot Job that creates the two buckets Sentinel needs.
+# Runs after the StatefulSet is ready (depends_on + wait_for_rollout above).
+# The until loop retries the alias-set command to handle the brief window
+# between the readiness probe passing and the first external request succeeding.
+# --ignore-existing makes mc mb idempotent — safe to re-apply.
+#
+# Buckets created:
+#   models    — ONNX artifacts uploaded by the optimizer pipeline
+#   datasets  — training data archives used by the retrain pipeline
+
+resource "kubernetes_job_v1" "minio_init" {
+  metadata {
+    name      = "minio-bucket-init"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+  }
+
+  spec {
+    template {
+      metadata {}
+
+      spec {
+        restart_policy = "OnFailure"
+
+        container {
+          name  = "mc"
+          image = "minio/mc:RELEASE.2024-11-21T17-21-54Z"
+
+          command = [
+            "/bin/sh", "-c",
+            <<-SCRIPT
+              until mc alias set minio http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" --api S3v4; do
+                echo "MinIO not ready yet, retrying in 3s..."
+                sleep 3
+              done
+              mc mb --ignore-existing minio/models
+              mc mb --ignore-existing minio/datasets
+              echo "Buckets ready."
+            SCRIPT
+          ]
+
+          env {
+            name = "MINIO_ROOT_USER"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.minio.metadata[0].name
+                key  = "root-user"
+              }
+            }
+          }
+          env {
+            name = "MINIO_ROOT_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.minio.metadata[0].name
+                key  = "root-password"
+              }
+            }
+          }
+        }
+      }
+    }
+
+    backoff_limit = 4
+  }
+
+  depends_on = [
+    kubernetes_stateful_set.minio,
+    kubernetes_service.minio,
+  ]
+
+  wait_for_completion = true
+
+  timeouts {
+    create = "3m"
+  }
+}
