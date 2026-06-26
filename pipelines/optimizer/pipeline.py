@@ -37,7 +37,7 @@ def run(model_id: str, output_dir: str, log_dir: str = "logs", opset: int = 17) 
     }
 
     stages = [
-        ("export",   lambda: export(model_id, run_artifacts / "fp32", opset=opset)),
+        ("export", lambda: export(model_id, run_artifacts / "fp32", opset=opset)),
         ("optimize", lambda: optimize(run_artifacts / "fp32", run_artifacts / "o2")),
         ("quantize", lambda: quantize(run_artifacts / "o2", run_artifacts / "int8")),
     ]
