@@ -2,10 +2,12 @@
 name = "sentinel"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "psycopg>=3.3.4",
+]
 
 [tool.uv.workspace]
-members = ["services/*"]
+members = ["services/*", "pipelines/optimizer"]
 
 # CUDA 13.0 wheels — matches the RTX 4070 driver (CUDA Version: 13.0)
 [[tool.uv.index]]
@@ -35,3 +37,4 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["services/classifier"]

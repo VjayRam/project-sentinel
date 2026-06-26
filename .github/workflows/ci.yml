@@ -18,7 +18,8 @@ jobs:
           python-version: "3.12"
           enable-caching: true
 
-      - run: uv sync --dev
+      # Only dev deps needed — ruff doesn't require any workspace member to be installed.
+      - run: uv sync --only-dev
 
       - name: ruff check
         run: uv run ruff check .
@@ -48,9 +49,10 @@ jobs:
           python-version: "3.12"
           enable-caching: true
 
-      # Dev deps only — torch is never downloaded in CI.
-      # Tests mock the model; see tests/conftest.py.
-      - run: uv sync --dev
+      # Sync only the classifier package + root dev deps (pytest, httpx, etc.).
+      # This avoids downloading torch/optimum from the optimizer pipeline (~2 GB).
+      # Tests mock the Classifier so no model weights or ONNX runtime calls happen.
+      - run: uv sync --package sentinel-classifier --dev
 
       - name: pytest
         run: uv run pytest --tb=short -q

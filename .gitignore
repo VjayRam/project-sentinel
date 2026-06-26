@@ -6,13 +6,12 @@ dist/
 build/
 .pytest_cache/
 .terraform/
-*.tfstate
-*.tfstate.backup
-.terraform.lock.hcl
+*.tfstate*
 *.onnx
 models/
 data/
 logs/
+artifacts/
 *.parquet
 *.csv
 .DS_Store
