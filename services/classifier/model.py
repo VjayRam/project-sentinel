@@ -104,8 +104,8 @@ class Classifier:
 
         config = json.loads((model_dir / "config.json").read_text())
         self.model_id = source_model_id or config.get("_name_or_path") or str(model_dir)
-        model_name = self.model_id.split("/")[-1]
-        self.model_version = f"{model_name}-{deployed_at}"
+        quant_tag = model_dir.name  # "int8", "o2", or "fp32"
+        self.model_version = f"sentinel-roberta-{deployed_at}-{quant_tag}"
         self.threshold = _THRESHOLD
         self.model_path = str(model_dir)
 
@@ -133,7 +133,15 @@ class Classifier:
         ort_inputs = {k: v for k, v in inputs.items() if k in self._input_names}
         logits = self._session.run(["logits"], ort_inputs)[0]
 
-        scores = _sigmoid(logits).squeeze(axis=-1)
+        if logits.shape[-1] == 1:
+            # Single-logit binary head: sigmoid gives P(harm) directly.
+            scores = _sigmoid(logits).squeeze(axis=-1)
+        else:
+            # Multi-class softmax head: take P(last class) as the harm score.
+            # Assumes label ordering: 0 = safe, last = harm (standard HF convention).
+            exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            scores = (exp / exp.sum(axis=-1, keepdims=True))[:, -1]
+
         labels = np.where(scores >= _THRESHOLD, "harm", "safe")
 
         return [

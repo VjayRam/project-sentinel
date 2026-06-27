@@ -36,6 +36,7 @@ MODEL_PATH=/path/to/int8 ./scripts/dev-start.sh
 | MinIO S3 API | `http://localhost:9000` | access: `sentinel` secret: `sentinel-minio` | Phase 3 ✓ |
 | PostgreSQL | `localhost:5432` | `sentinel` / `sentinel` / db `sentinel` | Phase 3 ✓ |
 | MongoDB | `localhost:27017` | `sentinel` / `sentinel` / db `sentinel` | Phase 3 ✓ |
+| mongo-express | `http://localhost:8081` | no login | Phase 3 ✓ |
 | Prometheus | `http://localhost:9090` | — | Phase 4 ✓ |
 | Grafana | `http://localhost:3000` | `admin` / `admin` | Phase 4 ✓ |
 
@@ -313,6 +314,21 @@ Document shape (when stream processor is wired in Phase 5):
   "span_id": "..."
 }
 ```
+
+---
+
+## mongo-express
+
+**URL:** `http://localhost:8081` (no login required — local dev only)
+
+Browser UI for inspecting MongoDB collections. Useful for verifying what the stream processor writes to `flagged_content`.
+
+### Manual port-forward
+```bash
+kubectl port-forward -n sentinel-data svc/mongo-express 8081:8081 &
+```
+
+`dev-start.sh` opens this automatically. Navigate to `http://localhost:8081` → select the `sentinel` database → open `flagged_content`.
 
 ---
 

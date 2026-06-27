@@ -81,3 +81,8 @@ output "grafana_port_forward" {
   description = "Command to open Grafana in your browser (http://localhost:3000, admin/admin)"
   value       = "kubectl port-forward -n sentinel-monitoring svc/grafana 3000:3000"
 }
+
+output "mongo_express_port_forward" {
+  description = "Command to open mongo-express in your browser (http://localhost:8081)"
+  value       = "kubectl port-forward -n sentinel-data svc/mongo-express 8081:8081"
+}

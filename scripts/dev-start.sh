@@ -86,18 +86,19 @@ fi
 kubectl config use-context "k3d-$CLUSTER" >/dev/null
 
 # ── terraform ─────────────────────────────────────────────────────────────────
-info "Applying Terraform (PostgreSQL + MongoDB + MinIO)..."
+info "Applying Terraform (PostgreSQL + MongoDB + MinIO + mongo-express + Prometheus + Grafana)..."
 cd "$TF_DIR"
 terraform apply -auto-approve
 cd "$REPO_ROOT"
 
 # ── wait for pods ─────────────────────────────────────────────────────────────
 info "Waiting for data-layer pods to pass readiness probes..."
-kubectl wait --for=condition=ready pod -l app=postgresql -n sentinel-data       --timeout=120s
-kubectl wait --for=condition=ready pod -l app=mongodb    -n sentinel-data       --timeout=120s
-kubectl wait --for=condition=ready pod -l app=minio      -n sentinel-data       --timeout=120s
-kubectl wait --for=condition=ready pod -l app=prometheus -n sentinel-monitoring --timeout=120s
-kubectl wait --for=condition=ready pod -l app=grafana    -n sentinel-monitoring --timeout=120s
+kubectl wait --for=condition=ready pod -l app=postgresql    -n sentinel-data       --timeout=120s
+kubectl wait --for=condition=ready pod -l app=mongodb       -n sentinel-data       --timeout=120s
+kubectl wait --for=condition=ready pod -l app=minio         -n sentinel-data       --timeout=120s
+kubectl wait --for=condition=ready pod -l app=mongo-express -n sentinel-data       --timeout=120s
+kubectl wait --for=condition=ready pod -l app=prometheus    -n sentinel-monitoring --timeout=120s
+kubectl wait --for=condition=ready pod -l app=grafana       -n sentinel-monitoring --timeout=120s
 info "All pods ready"
 
 # ── sync PostgreSQL password ───────────────────────────────────────────────────
@@ -143,6 +144,9 @@ kubectl port-forward --address=0.0.0.0 -n sentinel-data svc/mongodb 27017:27017 
 kubectl port-forward --address=0.0.0.0 -n sentinel-data svc/minio 9000:9000 9001:9001 \
     &>"$PF_DIR/minio.log" & echo $! >"$PF_DIR/minio.pid"
 
+kubectl port-forward --address=0.0.0.0 -n sentinel-data svc/mongo-express 8081:8081 \
+    &>"$PF_DIR/mongo-express.log" & echo $! >"$PF_DIR/mongo-express.pid"
+
 kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/prometheus 9090:9090 \
     &>"$PF_DIR/prometheus.log" & echo $! >"$PF_DIR/prometheus.pid"
 
@@ -151,11 +155,12 @@ kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/grafana 3000:3
 
 # Verify each tunnel actually opened — prints a clear success or failure line.
 # Errors are in $PF_DIR/*.log so the user knows exactly where to look.
-wait_for_port "PostgreSQL"  5432  postgres
-wait_for_port "MongoDB"     27017 mongo
-wait_for_port "MinIO"       9000  minio
-wait_for_port "Prometheus"  9090  prometheus
-wait_for_port "Grafana"     3000  grafana
+wait_for_port "PostgreSQL"    5432  postgres
+wait_for_port "MongoDB"       27017 mongo
+wait_for_port "MinIO"         9000  minio
+wait_for_port "mongo-express" 8081  mongo-express
+wait_for_port "Prometheus"    9090  prometheus
+wait_for_port "Grafana"       3000  grafana
 
 # ── classifier ─────────────────────────────────────────────────────────────────
 
@@ -164,13 +169,63 @@ export MINIO_ENDPOINT="http://localhost:9000"
 export MINIO_ACCESS_KEY="sentinel"
 export MINIO_SECRET_KEY="sentinel-minio"
 
-# Model loading priority (automatic — no action required in most cases):
-#   1. model_registry table (active or most recent staging) → download from MinIO
-#   2. MODEL_PATH env var → load that directory directly
-#   3. logs/optimizer/*/report.json auto-discovery → use local int8 path
-# Run the optimizer first if the registry is empty and MODEL_PATH is not set.
-if [[ -z "${MODEL_PATH:-}" ]]; then
-    info "MODEL_PATH not set — classifier will load from model_registry (MinIO) or logs/optimizer/"
+# ── auto-bootstrap: run optimizer if no valid model exists ────────────────────
+# Checks model_registry for a usable path before starting the classifier so
+# the startup never fails silently. Three cases handled:
+#   1. No staging/active row        → run optimizer
+#   2. Local absolute path missing  → delete stale row, run optimizer
+#   3. MinIO key (models/...)       → fine, classifier downloads on startup
+# Skipped when MODEL_PATH is set explicitly (manual override).
+# Skipped when psql is not installed (falls through to classifier's own logic).
+if [[ -z "${MODEL_PATH:-}" ]] && command -v psql >/dev/null 2>&1; then
+    _registry_path=$(psql "$DATABASE_URL" -t -A -c "
+        SELECT model_path FROM model_registry
+        WHERE status IN ('active','staging')
+        ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                 COALESCE(promoted_at, created_at) DESC
+        LIMIT 1" 2>/dev/null || true)
+
+    _needs_optimizer=false
+
+    if [[ -z "$_registry_path" ]]; then
+        info "model_registry is empty — no model available."
+        _needs_optimizer=true
+    elif [[ "$_registry_path" == /* ]]; then
+        # Local absolute path — check it still has ONNX files.
+        if ! find "$_registry_path" -maxdepth 1 -name "*.onnx" 2>/dev/null | grep -q .; then
+            warn "Registry has a stale local path (artifacts deleted): $_registry_path"
+            # Retire rather than delete — classifications FK references model_version.
+            psql "$DATABASE_URL" -c \
+                "UPDATE model_registry SET status = 'retired'
+                 WHERE model_path NOT LIKE 'models/%'
+                   AND status IN ('active','staging');" \
+                >/dev/null 2>&1 || true
+            _needs_optimizer=true
+        fi
+    fi
+    # MinIO key (models/...) → no action needed; classifier handles the download.
+
+    # logs/optimizer/ is a local fallback the classifier accepts without a DB entry.
+    if [[ "$_needs_optimizer" == true ]]; then
+        if find "$REPO_ROOT/logs/optimizer" -maxdepth 2 -name "report.json" \
+           2>/dev/null | grep -q .; then
+            info "Found completed optimizer run in logs/optimizer/ — skipping bootstrap."
+            _needs_optimizer=false
+        fi
+    fi
+
+    if [[ "$_needs_optimizer" == true ]]; then
+        info "Running optimizer pipeline to bootstrap the first model..."
+        info "(downloads ~500 MB on first run — this takes a few minutes)"
+        cd "$REPO_ROOT"
+        uv run --package sentinel-optimizer python -m pipelines.optimizer.pipeline \
+            --model-id VijayRam1812/content-classifier-roberta \
+            --output-dir artifacts \
+            --log-dir logs \
+        || die "Optimizer failed — fix the error above, then re-run dev-start.sh."
+        cd "$REPO_ROOT"
+        info "Optimizer complete — model registered and uploaded to MinIO."
+    fi
 fi
 
 info "Starting classifier at http://localhost:8000 ..."
@@ -181,7 +236,26 @@ uv run uvicorn main:app \
     --log-level info &
 UVICORN_PID=$!
 
-sleep 2   # wait for uvicorn to bind before printing the summary
+# Give uvicorn 4 seconds to bind. If it exits before then (e.g. no model in
+# registry and no logs/optimizer/ fallback), keep port-forwards alive so the
+# optimizer can be run in another terminal without restarting the whole stack.
+sleep 4
+if ! kill -0 "$UVICORN_PID" 2>/dev/null; then
+    warn "Classifier failed to start — no model found in registry or logs/optimizer/."
+    warn "Port-forwards are still open. Run the optimizer in another terminal:"
+    warn ""
+    warn "  DATABASE_URL=\"postgresql://sentinel:sentinel@localhost:5432/sentinel\" \\"
+    warn "  MINIO_ENDPOINT=\"http://localhost:9000\" \\"
+    warn "  MINIO_ACCESS_KEY=\"sentinel\" \\"
+    warn "  MINIO_SECRET_KEY=\"sentinel-minio\" \\"
+    warn "  uv run --package sentinel-optimizer python -m pipelines.optimizer.pipeline \\"
+    warn "    --model-id VijayRam1812/content-classifier-roberta --output-dir artifacts --log-dir logs"
+    warn ""
+    warn "Then re-run ./scripts/dev-start.sh. Press Ctrl-C to shut down port-forwards."
+    UVICORN_PID=""
+    # Keep the script (and port-forwards) alive until Ctrl-C.
+    while true; do sleep 60; done
+fi
 
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -196,6 +270,7 @@ echo "  Grafana          →  http://localhost:3000  (admin / admin)"
 echo "  Prometheus       →  http://localhost:9090"
 echo "  MinIO console    →  http://localhost:9001  (sentinel / sentinel-minio)"
 echo "  MinIO S3 API     →  http://localhost:9000"
+echo "  mongo-express    →  http://localhost:8081  (MongoDB browser UI, no login)"
 echo ""
 echo "  PostgreSQL       →  localhost:5432  (sentinel / sentinel)"
 echo "  MongoDB          →  localhost:27017 (sentinel / sentinel)"
@@ -205,4 +280,26 @@ echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-wait "$UVICORN_PID"
+# wait returns non-zero if uvicorn exited with a failure code (e.g. startup
+# error due to missing model). With set -e the || prevents that from killing
+# the script — instead we keep port-forwards alive so the optimizer can be
+# run in another terminal without restarting the whole stack.
+wait "$UVICORN_PID" || {
+    echo ""
+    warn "Classifier exited unexpectedly (likely no model in registry or logs/optimizer/)."
+    warn "Port-forwards are still open. In another terminal, clean up and run the optimizer:"
+    warn ""
+    warn "  psql 'postgresql://sentinel:sentinel@localhost:5432/sentinel' \\"
+    warn "    -c \"DELETE FROM model_registry WHERE model_path LIKE '/home/%';\""
+    warn ""
+    warn "  DATABASE_URL='postgresql://sentinel:sentinel@localhost:5432/sentinel' \\"
+    warn "  MINIO_ENDPOINT='http://localhost:9000' \\"
+    warn "  MINIO_ACCESS_KEY='sentinel' \\"
+    warn "  MINIO_SECRET_KEY='sentinel-minio' \\"
+    warn "  uv run --package sentinel-optimizer python -m pipelines.optimizer.pipeline \\"
+    warn "    --model-id VijayRam1812/content-classifier-roberta --output-dir artifacts --log-dir logs"
+    warn ""
+    warn "Then Ctrl-C here and re-run ./scripts/dev-start.sh."
+    UVICORN_PID=""
+    while true; do sleep 60; done
+}

@@ -926,3 +926,119 @@ resource "kubernetes_service" "grafana" {
     type = "ClusterIP"
   }
 }
+
+# ── mongo-express ──────────────────────────────────────────────────────────────
+# Browser UI for inspecting MongoDB collections during local dev.
+# Connects as the sentinel application user (read-write on the sentinel database).
+# Basic auth disabled — only port-forwarded to localhost, never internet-exposed.
+# Useful for inspecting flagged_content as the stream processor (Phase 5) writes
+# harmful spans, and for verifying document shape before building the retrain DAG.
+
+resource "kubernetes_deployment" "mongo_express" {
+  metadata {
+    name      = "mongo-express"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+    labels    = { app = "mongo-express" }
+  }
+
+  spec {
+    replicas = 1
+
+    selector {
+      match_labels = { app = "mongo-express" }
+    }
+
+    template {
+      metadata {
+        labels = { app = "mongo-express" }
+      }
+
+      spec {
+        container {
+          name  = "mongo-express"
+          image = "mongo-express:1.0.2-20"
+
+          # The entrypoint only reads ME_CONFIG_MONGODB_URL — individual SERVER/PORT
+          # vars are not used for the startup connectivity check. K8s expands
+          # $(VAR_NAME) in env values to inject the secret password into the URL.
+          # Root user is required: mongo-express runs db.adminCommand(serverStatus)
+          # on startup, which the sentinel app user (readWrite on sentinel db only)
+          # is not authorized to execute. Local dev only — never internet-exposed.
+          env {
+            name = "ME_CONFIG_MONGODB_ROOT_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.mongodb.metadata[0].name
+                key  = "root-password"
+              }
+            }
+          }
+          env {
+            name  = "ME_CONFIG_MONGODB_URL"
+            value = "mongodb://root:$(ME_CONFIG_MONGODB_ROOT_PASSWORD)@mongodb:27017/?authSource=admin"
+          }
+          env {
+            name  = "ME_CONFIG_BASICAUTH"
+            value = "false"
+          }
+
+          port {
+            container_port = 8081
+          }
+
+          resources {
+            requests = { cpu = "50m", memory = "64Mi" }
+            limits   = { cpu = "100m", memory = "128Mi" }
+          }
+
+          readiness_probe {
+            http_get {
+              path = "/"
+              port = 8081
+            }
+            initial_delay_seconds = 10
+            period_seconds        = 5
+            failure_threshold     = 6
+          }
+
+          liveness_probe {
+            http_get {
+              path = "/"
+              port = 8081
+            }
+            initial_delay_seconds = 20
+            period_seconds        = 15
+            failure_threshold     = 3
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [kubernetes_stateful_set.mongodb, kubernetes_service.mongodb]
+
+  wait_for_rollout = true
+
+  timeouts {
+    create = "3m"
+    update = "3m"
+  }
+}
+
+resource "kubernetes_service" "mongo_express" {
+  metadata {
+    name      = "mongo-express"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+  }
+
+  spec {
+    selector = { app = "mongo-express" }
+
+    port {
+      port        = 8081
+      target_port = 8081
+    }
+
+    type = "ClusterIP"
+  }
+}
