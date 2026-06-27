@@ -45,6 +45,7 @@ CLUSTER="sentinel"
 TF_DIR="$REPO_ROOT/infra/terraform/local"
 PF_DIR="/tmp/sentinel-pf"
 UVICORN_PID=""
+STREAM_PID=""
 
 mkdir -p "$PF_DIR"
 
@@ -53,6 +54,7 @@ cleanup() {
     echo ""
     info "Shutting down..."
     [[ -n "$UVICORN_PID" ]] && kill "$UVICORN_PID" 2>/dev/null || true
+    [[ -n "$STREAM_PID"  ]] && kill "$STREAM_PID"  2>/dev/null || true
     for pid_file in "$PF_DIR"/*.pid; do
         [[ -f "$pid_file" ]] && kill "$(cat "$pid_file")" 2>/dev/null || true
     done
@@ -86,19 +88,22 @@ fi
 kubectl config use-context "k3d-$CLUSTER" >/dev/null
 
 # ── terraform ─────────────────────────────────────────────────────────────────
-info "Applying Terraform (PostgreSQL + MongoDB + MinIO + mongo-express + Prometheus + Grafana)..."
+info "Applying Terraform (PostgreSQL + MongoDB + MinIO + mongo-express + Prometheus + Grafana + Kafka + Jaeger + OTel Collector)..."
 cd "$TF_DIR"
 terraform apply -auto-approve
 cd "$REPO_ROOT"
 
 # ── wait for pods ─────────────────────────────────────────────────────────────
-info "Waiting for data-layer pods to pass readiness probes..."
+info "Waiting for pods to pass readiness probes..."
 kubectl wait --for=condition=ready pod -l app=postgresql    -n sentinel-data       --timeout=120s
 kubectl wait --for=condition=ready pod -l app=mongodb       -n sentinel-data       --timeout=120s
 kubectl wait --for=condition=ready pod -l app=minio         -n sentinel-data       --timeout=120s
 kubectl wait --for=condition=ready pod -l app=mongo-express -n sentinel-data       --timeout=120s
+kubectl wait --for=condition=ready pod -l app=kafka         -n sentinel-data       --timeout=180s
 kubectl wait --for=condition=ready pod -l app=prometheus    -n sentinel-monitoring --timeout=120s
 kubectl wait --for=condition=ready pod -l app=grafana       -n sentinel-monitoring --timeout=120s
+kubectl wait --for=condition=ready pod -l app=jaeger        -n sentinel-monitoring --timeout=60s
+kubectl wait --for=condition=ready pod -l app=otel-collector -n sentinel-monitoring --timeout=60s
 info "All pods ready"
 
 # ── sync PostgreSQL password ───────────────────────────────────────────────────
@@ -122,6 +127,19 @@ else
     warn "  cd infra/terraform/local && terraform apply -auto-approve"
     die "Cannot guarantee DB connectivity — fix the PostgreSQL password first."
 fi
+
+# ── Phase 5 schema migration ──────────────────────────────────────────────────
+# Adds span_id / text_type columns to classifications if they don't exist yet.
+# Safe to run on every startup — all statements are idempotent.
+info "Running schema migrations..."
+psql "$DATABASE_URL" -c "
+    ALTER TABLE classifications ADD COLUMN IF NOT EXISTS span_id   TEXT;
+    ALTER TABLE classifications ADD COLUMN IF NOT EXISTS text_type VARCHAR(8);
+    CREATE UNIQUE INDEX IF NOT EXISTS classifications_span_id_text_type_idx
+        ON classifications (span_id, text_type)
+        WHERE span_id IS NOT NULL;
+" >/dev/null 2>&1 && info "Schema up-to-date" \
+  || warn "Schema migration failed — check PostgreSQL logs"
 
 # ── kill stale port-forwards from a previous run ──────────────────────────────
 for pid_file in "$PF_DIR"/*.pid; do
@@ -153,6 +171,16 @@ kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/prometheus 909
 kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/grafana 3000:3000 \
     &>"$PF_DIR/grafana.log" & echo $! >"$PF_DIR/grafana.pid"
 
+# Phase 5: Kafka (EXTERNAL listener), Jaeger, OTel Collector
+kubectl port-forward --address=0.0.0.0 -n sentinel-data svc/kafka 9094:9094 \
+    &>"$PF_DIR/kafka.log" & echo $! >"$PF_DIR/kafka.pid"
+
+kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/jaeger 16686:16686 \
+    &>"$PF_DIR/jaeger.log" & echo $! >"$PF_DIR/jaeger.pid"
+
+kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/otel-collector 4317:4317 4318:4318 \
+    &>"$PF_DIR/otel-collector.log" & echo $! >"$PF_DIR/otel-collector.pid"
+
 # Verify each tunnel actually opened — prints a clear success or failure line.
 # Errors are in $PF_DIR/*.log so the user knows exactly where to look.
 wait_for_port "PostgreSQL"    5432  postgres
@@ -161,6 +189,9 @@ wait_for_port "MinIO"         9000  minio
 wait_for_port "mongo-express" 8081  mongo-express
 wait_for_port "Prometheus"    9090  prometheus
 wait_for_port "Grafana"       3000  grafana
+wait_for_port "Kafka"         9094  kafka
+wait_for_port "Jaeger"        16686 jaeger
+wait_for_port "OTel Collector" 4317 otel-collector
 
 # ── classifier ─────────────────────────────────────────────────────────────────
 
@@ -253,8 +284,25 @@ if ! kill -0 "$UVICORN_PID" 2>/dev/null; then
     warn ""
     warn "Then re-run ./scripts/dev-start.sh. Press Ctrl-C to shut down port-forwards."
     UVICORN_PID=""
-    # Keep the script (and port-forwards) alive until Ctrl-C.
     while true; do sleep 60; done
+fi
+
+# ── stream processor ───────────────────────────────────────────────────────────
+info "Starting stream processor (Kafka → classify → PostgreSQL + MongoDB)..."
+cd "$REPO_ROOT/services/stream-processor"
+KAFKA_BOOTSTRAP_SERVERS="localhost:9094" \
+DATABASE_URL="$DATABASE_URL" \
+MONGO_URI="mongodb://sentinel:sentinel@localhost:27017/sentinel" \
+CLASSIFIER_URL="http://localhost:8000" \
+SAFE_SAMPLE_RATE="0.1" \
+    uv run python main.py &>"$PF_DIR/stream-processor.log" &
+STREAM_PID=$!
+cd "$REPO_ROOT"
+
+sleep 2
+if ! kill -0 "$STREAM_PID" 2>/dev/null; then
+    warn "Stream processor failed to start — check $PF_DIR/stream-processor.log"
+    STREAM_PID=""
 fi
 
 echo ""
@@ -266,31 +314,34 @@ echo "  Classifier API   →  http://localhost:8000"
 echo "  Classifier docs  →  http://localhost:8000/docs"
 echo "  Prometheus scrape →  http://localhost:8000/metrics"
 echo ""
+echo "  Jaeger UI        →  http://localhost:16686"
 echo "  Grafana          →  http://localhost:3000  (admin / admin)"
 echo "  Prometheus       →  http://localhost:9090"
 echo "  MinIO console    →  http://localhost:9001  (sentinel / sentinel-minio)"
 echo "  MinIO S3 API     →  http://localhost:9000"
 echo "  mongo-express    →  http://localhost:8081  (MongoDB browser UI, no login)"
 echo ""
+echo "  OTel Collector   →  grpc://localhost:4317  http://localhost:4318"
+echo "  Kafka (EXTERNAL) →  localhost:9094"
+echo ""
 echo "  PostgreSQL       →  localhost:5432  (sentinel / sentinel)"
 echo "  MongoDB          →  localhost:27017 (sentinel / sentinel)"
+echo ""
+echo "  Simulate traces: python scripts/simulate-traces.py"
+echo "  Stream logs:     tail -f $PF_DIR/stream-processor.log"
 echo ""
 echo "  See docs/local-dev.md for curl examples, schemas, and full reference."
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
-# wait returns non-zero if uvicorn exited with a failure code (e.g. startup
-# error due to missing model). With set -e the || prevents that from killing
-# the script — instead we keep port-forwards alive so the optimizer can be
-# run in another terminal without restarting the whole stack.
 wait "$UVICORN_PID" || {
     echo ""
     warn "Classifier exited unexpectedly (likely no model in registry or logs/optimizer/)."
     warn "Port-forwards are still open. In another terminal, clean up and run the optimizer:"
     warn ""
     warn "  psql 'postgresql://sentinel:sentinel@localhost:5432/sentinel' \\"
-    warn "    -c \"DELETE FROM model_registry WHERE model_path LIKE '/home/%';\""
+    warn "    -c \"UPDATE model_registry SET status = 'retired' WHERE status IN ('active','staging');\""
     warn ""
     warn "  DATABASE_URL='postgresql://sentinel:sentinel@localhost:5432/sentinel' \\"
     warn "  MINIO_ENDPOINT='http://localhost:9000' \\"

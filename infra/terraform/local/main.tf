@@ -66,7 +66,9 @@ resource "kubernetes_config_map" "postgres_init" {
           model_version VARCHAR(100) NOT NULL
                         REFERENCES model_registry(model_version),
           latency_ms    FLOAT        NOT NULL,
-          inference_at  TIMESTAMPTZ  NOT NULL
+          inference_at  TIMESTAMPTZ  NOT NULL,
+          span_id       TEXT,
+          text_type     VARCHAR(8)
       );
 
       CREATE INDEX IF NOT EXISTS classifications_ts_idx
@@ -77,6 +79,13 @@ resource "kubernetes_config_map" "postgres_init" {
 
       CREATE INDEX IF NOT EXISTS classifications_model_version_ts_idx
           ON classifications (model_version, ts DESC);
+
+      -- Partial unique index for stream processor idempotency.
+      -- ON CONFLICT (span_id, text_type) WHERE span_id IS NOT NULL DO NOTHING
+      -- prevents duplicate rows when Kafka redelivers a message.
+      CREATE UNIQUE INDEX IF NOT EXISTS classifications_span_id_text_type_idx
+          ON classifications (span_id, text_type)
+          WHERE span_id IS NOT NULL;
     SQL
   }
 }
@@ -1039,6 +1048,352 @@ resource "kubernetes_service" "mongo_express" {
       target_port = 8081
     }
 
+    type = "ClusterIP"
+  }
+}
+
+# ── Kafka (KRaft, single broker) ──────────────────────────────────────────────
+# Single combined broker+controller node — no ZooKeeper.
+# Two listeners:
+#   PLAINTEXT :9092  — in-cluster (OTel Collector → Kafka)
+#   EXTERNAL  :9094  — host access via kubectl port-forward (stream processor)
+# ADVERTISED_LISTENERS for EXTERNAL is localhost:9094 so metadata responses
+# point back through the port-forward after the initial connection.
+
+resource "kubernetes_stateful_set" "kafka" {
+  metadata {
+    name      = "kafka"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+    labels    = { app = "kafka" }
+  }
+
+  spec {
+    service_name = "kafka"
+    replicas     = 1
+
+    selector {
+      match_labels = { app = "kafka" }
+    }
+
+    template {
+      metadata {
+        labels = { app = "kafka" }
+      }
+
+      spec {
+        container {
+          name  = "kafka"
+          image = "bitnami/kafka:3.7"
+
+          env { name = "KAFKA_CFG_NODE_ID";                               value = "1" }
+          env { name = "KAFKA_CFG_PROCESS_ROLES";                         value = "broker,controller" }
+          env { name = "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS";              value = "1@localhost:9093" }
+          env { name = "KAFKA_CFG_LISTENERS";                             value = "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094" }
+          env { name = "KAFKA_CFG_ADVERTISED_LISTENERS";                  value = "PLAINTEXT://kafka.sentinel-data.svc.cluster.local:9092,EXTERNAL://localhost:9094" }
+          env { name = "KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP";        value = "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT" }
+          env { name = "KAFKA_CFG_CONTROLLER_LISTENER_NAMES";             value = "CONTROLLER" }
+          env { name = "KAFKA_CFG_INTER_BROKER_LISTENER_NAME";            value = "PLAINTEXT" }
+          env { name = "KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE";             value = "false" }
+          env { name = "KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR";      value = "1" }
+          env { name = "KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR"; value = "1" }
+          env { name = "KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR";         value = "1" }
+
+          port { container_port = 9092; name = "plaintext" }
+          port { container_port = 9093; name = "controller" }
+          port { container_port = 9094; name = "external" }
+
+          resources {
+            requests = { cpu = "200m", memory = "512Mi" }
+            limits   = { cpu = "500m", memory = "1Gi" }
+          }
+
+          readiness_probe {
+            tcp_socket { port = 9092 }
+            initial_delay_seconds = 30
+            period_seconds        = 10
+            failure_threshold     = 6
+          }
+
+          liveness_probe {
+            tcp_socket { port = 9092 }
+            initial_delay_seconds = 60
+            period_seconds        = 30
+            failure_threshold     = 3
+          }
+
+          volume_mount {
+            name       = "data"
+            mount_path = "/bitnami/kafka"
+          }
+        }
+      }
+    }
+
+    volume_claim_template {
+      metadata { name = "data" }
+      spec {
+        access_modes       = ["ReadWriteOnce"]
+        storage_class_name = "local-path"
+        resources { requests = { storage = var.kafka_storage_size } }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+  timeouts { create = "5m"; update = "5m" }
+}
+
+resource "kubernetes_service" "kafka" {
+  metadata {
+    name      = "kafka"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+  }
+
+  spec {
+    selector = { app = "kafka" }
+    port { name = "plaintext"; port = 9092; target_port = 9092 }
+    port { name = "external";  port = 9094; target_port = 9094 }
+    type = "ClusterIP"
+  }
+}
+
+resource "kubernetes_job_v1" "kafka_topic_init" {
+  metadata {
+    name      = "kafka-topic-init"
+    namespace = kubernetes_namespace.sentinel["sentinel-data"].metadata[0].name
+  }
+
+  spec {
+    template {
+      metadata {}
+      spec {
+        restart_policy = "OnFailure"
+        container {
+          name  = "kafka-topic-init"
+          image = "bitnami/kafka:3.7"
+          command = [
+            "/bin/sh", "-c",
+            "kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic traces.raw --partitions 3 --replication-factor 1 && echo 'topic ready'"
+          ]
+          resources {
+            requests = { cpu = "50m", memory = "128Mi" }
+            limits   = { cpu = "100m", memory = "256Mi" }
+          }
+        }
+      }
+    }
+    backoff_limit = 10
+  }
+
+  depends_on      = [kubernetes_stateful_set.kafka, kubernetes_service.kafka]
+  wait_for_completion = true
+  timeouts { create = "5m" }
+}
+
+# ── Jaeger (all-in-one, in-memory) ────────────────────────────────────────────
+# Local dev only — traces do not survive pod restarts.
+# OTLP gRPC receiver on :4317 (used by OTel Collector).
+# UI on :16686.
+
+resource "kubernetes_deployment" "jaeger" {
+  metadata {
+    name      = "jaeger"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+    labels    = { app = "jaeger" }
+  }
+
+  spec {
+    replicas = 1
+
+    selector { match_labels = { app = "jaeger" } }
+
+    template {
+      metadata { labels = { app = "jaeger" } }
+
+      spec {
+        container {
+          name  = "jaeger"
+          image = "jaegertracing/all-in-one:1.62"
+
+          env { name = "COLLECTOR_OTLP_ENABLED"; value = "true" }
+
+          port { container_port = 16686; name = "ui" }
+          port { container_port = 4317;  name = "otlp-grpc" }
+
+          resources {
+            requests = { cpu = "100m", memory = "128Mi" }
+            limits   = { cpu = "200m", memory = "256Mi" }
+          }
+
+          readiness_probe {
+            http_get { path = "/"; port = 16686 }
+            initial_delay_seconds = 5
+            period_seconds        = 5
+            failure_threshold     = 6
+          }
+
+          liveness_probe {
+            http_get { path = "/"; port = 16686 }
+            initial_delay_seconds = 15
+            period_seconds        = 15
+            failure_threshold     = 3
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+  timeouts { create = "3m"; update = "3m" }
+}
+
+resource "kubernetes_service" "jaeger" {
+  metadata {
+    name      = "jaeger"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+  }
+
+  spec {
+    selector = { app = "jaeger" }
+    port { name = "ui";        port = 16686; target_port = 16686 }
+    port { name = "otlp-grpc"; port = 4317;  target_port = 4317 }
+    type = "ClusterIP"
+  }
+}
+
+# ── OTel Collector ────────────────────────────────────────────────────────────
+# Receives OTLP traces from chat apps (gRPC :4317, HTTP :4318).
+# Fan-out: Kafka exporter → traces.raw topic + OTLP exporter → Jaeger.
+# Uses the contrib image for the Kafka exporter.
+
+resource "kubernetes_config_map" "otel_collector_config" {
+  metadata {
+    name      = "otel-collector-config"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+  }
+
+  data = {
+    "config.yaml" = <<-YAML
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+        timeout: 1s
+        send_batch_size: 100
+
+    exporters:
+      kafka:
+        brokers:
+          - kafka.sentinel-data.svc.cluster.local:9092
+        topic: traces.raw
+        encoding: otlp_json
+      otlp/jaeger:
+        endpoint: jaeger.sentinel-monitoring.svc.cluster.local:4317
+        tls:
+          insecure: true
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [kafka, otlp/jaeger]
+    YAML
+  }
+}
+
+resource "kubernetes_deployment" "otel_collector" {
+  metadata {
+    name      = "otel-collector"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+    labels    = { app = "otel-collector" }
+  }
+
+  spec {
+    replicas = 1
+
+    selector { match_labels = { app = "otel-collector" } }
+
+    template {
+      metadata { labels = { app = "otel-collector" } }
+
+      spec {
+        container {
+          name  = "otel-collector"
+          image = "otel/opentelemetry-collector-contrib:0.113.0"
+
+          args = ["--config=/etc/otelcol/config.yaml"]
+
+          port { container_port = 4317;  name = "otlp-grpc" }
+          port { container_port = 4318;  name = "otlp-http" }
+          port { container_port = 13133; name = "health" }
+
+          resources {
+            requests = { cpu = "100m", memory = "128Mi" }
+            limits   = { cpu = "200m", memory = "256Mi" }
+          }
+
+          readiness_probe {
+            http_get { path = "/"; port = 13133 }
+            initial_delay_seconds = 10
+            period_seconds        = 5
+            failure_threshold     = 6
+          }
+
+          liveness_probe {
+            http_get { path = "/"; port = 13133 }
+            initial_delay_seconds = 20
+            period_seconds        = 15
+            failure_threshold     = 3
+          }
+
+          volume_mount {
+            name       = "config"
+            mount_path = "/etc/otelcol"
+          }
+        }
+
+        volume {
+          name = "config"
+          config_map {
+            name = kubernetes_config_map.otel_collector_config.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [
+    kubernetes_job_v1.kafka_topic_init,
+    kubernetes_deployment.jaeger,
+    kubernetes_service.jaeger,
+  ]
+
+  wait_for_rollout = true
+  timeouts { create = "3m"; update = "3m" }
+}
+
+resource "kubernetes_service" "otel_collector" {
+  metadata {
+    name      = "otel-collector"
+    namespace = kubernetes_namespace.sentinel["sentinel-monitoring"].metadata[0].name
+  }
+
+  spec {
+    selector = { app = "otel-collector" }
+    port { name = "otlp-grpc"; port = 4317; target_port = 4317 }
+    port { name = "otlp-http"; port = 4318; target_port = 4318 }
     type = "ClusterIP"
   }
 }

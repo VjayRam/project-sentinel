@@ -68,3 +68,9 @@ variable "grafana_admin_password" {
   sensitive   = true
   default     = "admin"
 }
+
+variable "kafka_storage_size" {
+  description = "PVC size for Kafka data"
+  type        = string
+  default     = "2Gi"
+}

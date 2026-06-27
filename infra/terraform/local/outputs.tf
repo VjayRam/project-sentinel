@@ -86,3 +86,23 @@ output "mongo_express_port_forward" {
   description = "Command to open mongo-express in your browser (http://localhost:8081)"
   value       = "kubectl port-forward -n sentinel-data svc/mongo-express 8081:8081"
 }
+
+output "kafka_port_forward" {
+  description = "Command to reach Kafka (EXTERNAL listener) from your local machine"
+  value       = "kubectl port-forward -n sentinel-data svc/kafka 9094:9094"
+}
+
+output "jaeger_port_forward" {
+  description = "Command to open Jaeger UI from your local machine (http://localhost:16686)"
+  value       = "kubectl port-forward -n sentinel-monitoring svc/jaeger 16686:16686"
+}
+
+output "otel_collector_grpc_port_forward" {
+  description = "Command to send OTLP gRPC traces to the collector from your local machine (:4317)"
+  value       = "kubectl port-forward -n sentinel-monitoring svc/otel-collector 4317:4317"
+}
+
+output "otel_collector_http_port_forward" {
+  description = "Command to send OTLP HTTP traces to the collector from your local machine (:4318)"
+  value       = "kubectl port-forward -n sentinel-monitoring svc/otel-collector 4318:4318"
+}

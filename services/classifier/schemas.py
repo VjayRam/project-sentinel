@@ -20,6 +20,7 @@ class ClassifyResponse(ClassifyResult):
 
 class BatchClassifyRequest(BaseModel):
     texts: list[str] = Field(min_length=1, max_length=MAX_BATCH_SIZE)
+    persist: bool = True  # False skips classifier's own PG write; stream processor handles it
 
 
 class BatchClassifyResponse(BaseModel):

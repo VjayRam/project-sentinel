@@ -172,7 +172,7 @@ async def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse
     for r in results:
         REQUEST_COUNT.labels(endpoint="classify_batch", label=r["label"]).inc()
 
-    if _pool:
+    if _pool and request.persist:
         records = [
             (text, r["label"], r["score"], _classifier.model_version, latency_ms, inference_at)
             for text, r in zip(request.texts, results)
