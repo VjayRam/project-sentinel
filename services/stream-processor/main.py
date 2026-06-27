@@ -96,23 +96,38 @@ def run() -> None:
 
             texts = [s["text"] for s in spans]
 
+            # Chunk texts to stay within MAX_BATCH_SIZE (64) per request.
+            # A single Kafka poll can accumulate many spans across multiple messages.
+            CHUNK = 64
+            chunks = [texts[i:i + CHUNK] for i in range(0, len(texts), CHUNK)]
+
             # persist=False: skip classifier's own PG write; we write here with span_id.
+            all_results: list[dict] = []
+            classify_ms_total = 0.0
+            model_version = ""
             try:
-                t0 = time.perf_counter()
-                resp = http.post("/v1/moderations", json={"input": texts, "persist": False})
-                resp.raise_for_status()
-                classify_ms = (time.perf_counter() - t0) * 1000
-                body = resp.json()
+                for chunk in chunks:
+                    t0 = time.perf_counter()
+                    resp = http.post("/v1/moderations", json={"input": chunk, "persist": False})
+                    if not resp.is_success:
+                        logger.error(
+                            "Classify HTTP %d — body: %s | chunk=%d texts",
+                            resp.status_code, resp.text[:300], len(chunk),
+                        )
+                    resp.raise_for_status()
+                    classify_ms_total += (time.perf_counter() - t0) * 1000
+                    body = resp.json()
+                    model_version = body["model"]
+                    all_results.extend(
+                        {"label": "harm" if r["flagged"] else "safe", "score": r["category_scores"]["harm"]}
+                        for r in body["results"]
+                    )
             except Exception:
                 logger.exception("Classify failed — not committing, Kafka will redeliver")
                 continue
 
-            model_version = body["model"]
-            results = [
-                {"label": "harm" if r["flagged"] else "safe", "score": r["category_scores"]["harm"]}
-                for r in body["results"]
-            ]
-            per_span_latency_ms = classify_ms / max(len(texts), 1)
+            results = all_results
+            per_span_latency_ms = classify_ms_total / max(len(texts), 1)
 
             try:
                 write_classifications(pg_conn, spans, results, model_version, per_span_latency_ms)

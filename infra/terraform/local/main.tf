@@ -1083,24 +1083,69 @@ resource "kubernetes_stateful_set" "kafka" {
       spec {
         container {
           name  = "kafka"
-          image = "bitnami/kafka:3.7"
+          image = "apache/kafka:latest"
 
-          env { name = "KAFKA_CFG_NODE_ID";                               value = "1" }
-          env { name = "KAFKA_CFG_PROCESS_ROLES";                         value = "broker,controller" }
-          env { name = "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS";              value = "1@localhost:9093" }
-          env { name = "KAFKA_CFG_LISTENERS";                             value = "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094" }
-          env { name = "KAFKA_CFG_ADVERTISED_LISTENERS";                  value = "PLAINTEXT://kafka.sentinel-data.svc.cluster.local:9092,EXTERNAL://localhost:9094" }
-          env { name = "KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP";        value = "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT" }
-          env { name = "KAFKA_CFG_CONTROLLER_LISTENER_NAMES";             value = "CONTROLLER" }
-          env { name = "KAFKA_CFG_INTER_BROKER_LISTENER_NAME";            value = "PLAINTEXT" }
-          env { name = "KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE";             value = "false" }
-          env { name = "KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR";      value = "1" }
-          env { name = "KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR"; value = "1" }
-          env { name = "KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR";         value = "1" }
+          env {
+            name  = "KAFKA_NODE_ID"
+            value = "1"
+          }
+          env {
+            name  = "KAFKA_PROCESS_ROLES"
+            value = "broker,controller"
+          }
+          env {
+            name  = "KAFKA_CONTROLLER_QUORUM_VOTERS"
+            value = "1@localhost:9093"
+          }
+          env {
+            name  = "KAFKA_LISTENERS"
+            value = "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+          }
+          env {
+            name  = "KAFKA_ADVERTISED_LISTENERS"
+            value = "PLAINTEXT://kafka.sentinel-data.svc.cluster.local:9092,EXTERNAL://localhost:9094"
+          }
+          env {
+            name  = "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP"
+            value = "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+          }
+          env {
+            name  = "KAFKA_CONTROLLER_LISTENER_NAMES"
+            value = "CONTROLLER"
+          }
+          env {
+            name  = "KAFKA_INTER_BROKER_LISTENER_NAME"
+            value = "PLAINTEXT"
+          }
+          env {
+            name  = "KAFKA_AUTO_CREATE_TOPICS_ENABLE"
+            value = "false"
+          }
+          env {
+            name  = "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR"
+            value = "1"
+          }
+          env {
+            name  = "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR"
+            value = "1"
+          }
+          env {
+            name  = "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR"
+            value = "1"
+          }
 
-          port { container_port = 9092; name = "plaintext" }
-          port { container_port = 9093; name = "controller" }
-          port { container_port = 9094; name = "external" }
+          port {
+            container_port = 9092
+            name           = "plaintext"
+          }
+          port {
+            container_port = 9093
+            name           = "controller"
+          }
+          port {
+            container_port = 9094
+            name           = "external"
+          }
 
           resources {
             requests = { cpu = "200m", memory = "512Mi" }
@@ -1140,7 +1185,10 @@ resource "kubernetes_stateful_set" "kafka" {
   }
 
   wait_for_rollout = true
-  timeouts { create = "5m"; update = "5m" }
+  timeouts {
+    create = "5m"
+    update = "5m"
+  }
 }
 
 resource "kubernetes_service" "kafka" {
@@ -1151,8 +1199,16 @@ resource "kubernetes_service" "kafka" {
 
   spec {
     selector = { app = "kafka" }
-    port { name = "plaintext"; port = 9092; target_port = 9092 }
-    port { name = "external";  port = 9094; target_port = 9094 }
+    port {
+      name        = "plaintext"
+      port        = 9092
+      target_port = 9092
+    }
+    port {
+      name        = "external"
+      port        = 9094
+      target_port = 9094
+    }
     type = "ClusterIP"
   }
 }
@@ -1170,10 +1226,10 @@ resource "kubernetes_job_v1" "kafka_topic_init" {
         restart_policy = "OnFailure"
         container {
           name  = "kafka-topic-init"
-          image = "bitnami/kafka:3.7"
+          image = "apache/kafka:latest"
           command = [
             "/bin/sh", "-c",
-            "kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic traces.raw --partitions 3 --replication-factor 1 && echo 'topic ready'"
+            "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic traces.raw --partitions 3 --replication-factor 1 && echo 'topic ready'"
           ]
           resources {
             requests = { cpu = "50m", memory = "128Mi" }
@@ -1213,12 +1269,21 @@ resource "kubernetes_deployment" "jaeger" {
       spec {
         container {
           name  = "jaeger"
-          image = "jaegertracing/all-in-one:1.62"
+          image = "jaegertracing/all-in-one:latest"
 
-          env { name = "COLLECTOR_OTLP_ENABLED"; value = "true" }
+          env {
+            name  = "COLLECTOR_OTLP_ENABLED"
+            value = "true"
+          }
 
-          port { container_port = 16686; name = "ui" }
-          port { container_port = 4317;  name = "otlp-grpc" }
+          port {
+            container_port = 16686
+            name           = "ui"
+          }
+          port {
+            container_port = 4317
+            name           = "otlp-grpc"
+          }
 
           resources {
             requests = { cpu = "100m", memory = "128Mi" }
@@ -1226,14 +1291,20 @@ resource "kubernetes_deployment" "jaeger" {
           }
 
           readiness_probe {
-            http_get { path = "/"; port = 16686 }
+            http_get {
+              path = "/"
+              port = 16686
+            }
             initial_delay_seconds = 5
             period_seconds        = 5
             failure_threshold     = 6
           }
 
           liveness_probe {
-            http_get { path = "/"; port = 16686 }
+            http_get {
+              path = "/"
+              port = 16686
+            }
             initial_delay_seconds = 15
             period_seconds        = 15
             failure_threshold     = 3
@@ -1244,7 +1315,10 @@ resource "kubernetes_deployment" "jaeger" {
   }
 
   wait_for_rollout = true
-  timeouts { create = "3m"; update = "3m" }
+  timeouts {
+    create = "3m"
+    update = "3m"
+  }
 }
 
 resource "kubernetes_service" "jaeger" {
@@ -1255,8 +1329,16 @@ resource "kubernetes_service" "jaeger" {
 
   spec {
     selector = { app = "jaeger" }
-    port { name = "ui";        port = 16686; target_port = 16686 }
-    port { name = "otlp-grpc"; port = 4317;  target_port = 4317 }
+    port {
+      name        = "ui"
+      port        = 16686
+      target_port = 16686
+    }
+    port {
+      name        = "otlp-grpc"
+      port        = 4317
+      target_port = 4317
+    }
     type = "ClusterIP"
   }
 }
@@ -1335,9 +1417,18 @@ resource "kubernetes_deployment" "otel_collector" {
 
           args = ["--config=/etc/otelcol/config.yaml"]
 
-          port { container_port = 4317;  name = "otlp-grpc" }
-          port { container_port = 4318;  name = "otlp-http" }
-          port { container_port = 13133; name = "health" }
+          port {
+            container_port = 4317
+            name           = "otlp-grpc"
+          }
+          port {
+            container_port = 4318
+            name           = "otlp-http"
+          }
+          port {
+            container_port = 13133
+            name           = "health"
+          }
 
           resources {
             requests = { cpu = "100m", memory = "128Mi" }
@@ -1345,14 +1436,20 @@ resource "kubernetes_deployment" "otel_collector" {
           }
 
           readiness_probe {
-            http_get { path = "/"; port = 13133 }
+            http_get {
+              path = "/"
+              port = 13133
+            }
             initial_delay_seconds = 10
             period_seconds        = 5
             failure_threshold     = 6
           }
 
           liveness_probe {
-            http_get { path = "/"; port = 13133 }
+            http_get {
+              path = "/"
+              port = 13133
+            }
             initial_delay_seconds = 20
             period_seconds        = 15
             failure_threshold     = 3
@@ -1381,7 +1478,10 @@ resource "kubernetes_deployment" "otel_collector" {
   ]
 
   wait_for_rollout = true
-  timeouts { create = "3m"; update = "3m" }
+  timeouts {
+    create = "3m"
+    update = "3m"
+  }
 }
 
 resource "kubernetes_service" "otel_collector" {
@@ -1392,8 +1492,16 @@ resource "kubernetes_service" "otel_collector" {
 
   spec {
     selector = { app = "otel-collector" }
-    port { name = "otlp-grpc"; port = 4317; target_port = 4317 }
-    port { name = "otlp-http"; port = 4318; target_port = 4318 }
+    port {
+      name        = "otlp-grpc"
+      port        = 4317
+      target_port = 4317
+    }
+    port {
+      name        = "otlp-http"
+      port        = 4318
+      target_port = 4318
+    }
     type = "ClusterIP"
   }
 }

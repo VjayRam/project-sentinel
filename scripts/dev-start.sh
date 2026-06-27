@@ -128,18 +128,9 @@ else
     die "Cannot guarantee DB connectivity — fix the PostgreSQL password first."
 fi
 
-# ── Phase 5 schema migration ──────────────────────────────────────────────────
-# Adds span_id / text_type columns to classifications if they don't exist yet.
-# Safe to run on every startup — all statements are idempotent.
-info "Running schema migrations..."
-psql "$DATABASE_URL" -c "
-    ALTER TABLE classifications ADD COLUMN IF NOT EXISTS span_id   TEXT;
-    ALTER TABLE classifications ADD COLUMN IF NOT EXISTS text_type VARCHAR(8);
-    CREATE UNIQUE INDEX IF NOT EXISTS classifications_span_id_text_type_idx
-        ON classifications (span_id, text_type)
-        WHERE span_id IS NOT NULL;
-" >/dev/null 2>&1 && info "Schema up-to-date" \
-  || warn "Schema migration failed — check PostgreSQL logs"
+# Export DATABASE_URL now that PG_PASSWORD is confirmed (used by the schema
+# migration below and by the model auto-bootstrap further down).
+export DATABASE_URL="postgresql://sentinel:${PG_PASSWORD}@localhost:5432/sentinel"
 
 # ── kill stale port-forwards from a previous run ──────────────────────────────
 for pid_file in "$PF_DIR"/*.pid; do
@@ -193,9 +184,22 @@ wait_for_port "Kafka"         9094  kafka
 wait_for_port "Jaeger"        16686 jaeger
 wait_for_port "OTel Collector" 4317 otel-collector
 
+# ── Phase 5 schema migration ──────────────────────────────────────────────────
+# Adds span_id / text_type columns to classifications if they don't exist yet.
+# Runs after port 5432 is verified open. Safe to run on every startup — all
+# statements are idempotent.
+info "Running schema migrations..."
+psql "$DATABASE_URL" -c "
+    ALTER TABLE classifications ADD COLUMN IF NOT EXISTS span_id   TEXT;
+    ALTER TABLE classifications ADD COLUMN IF NOT EXISTS text_type VARCHAR(8);
+    CREATE UNIQUE INDEX IF NOT EXISTS classifications_span_id_text_type_idx
+        ON classifications (span_id, text_type)
+        WHERE span_id IS NOT NULL;
+" >/dev/null 2>&1 && info "Schema up-to-date" \
+  || warn "Schema migration failed — check $PF_DIR/postgres.log"
+
 # ── classifier ─────────────────────────────────────────────────────────────────
 
-export DATABASE_URL="postgresql://sentinel:${PG_PASSWORD}@localhost:5432/sentinel"
 export MINIO_ENDPOINT="http://localhost:9000"
 export MINIO_ACCESS_KEY="sentinel"
 export MINIO_SECRET_KEY="sentinel-minio"
