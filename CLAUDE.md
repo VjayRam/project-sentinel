@@ -32,7 +32,7 @@ Chat app (external)
   → OTel Collector
   → Kafka topic: traces.raw
   → Stream processor (Python consumer)
-  → POST /classify (classifier service)
+  → POST /v1/moderations (classifier service)
   → PostgreSQL: classifications table
   → MongoDB: flagged_content (harmful only, for retraining)
   → Spark batch job: drift metrics → drift_stats table
@@ -41,14 +41,36 @@ Chat app (external)
 ```
 
 ### OTel span attributes the chat app must emit
+
+Follows the [OpenTelemetry GenAI Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) —
+the same format used by LangSmith, Arize Phoenix, OpenLLMetry, and
+`opentelemetry-instrumentation-openai`.
+
+**Span attributes** (non-sensitive metadata):
 ```
-llm.request.prompt       — user input text
-llm.response.content     — model output text
-llm.request.model        — which model was called
-llm.response.latency_ms  — inference time
-llm.response.tokens      — token count
-session.id               — conversation session
+gen_ai.system                 — provider: "openai", "anthropic", etc.
+gen_ai.request.model          — model name: "gpt-4o"
+gen_ai.request.max_tokens     — max tokens requested
+gen_ai.request.temperature    — sampling temperature
+gen_ai.response.model         — actual model that responded
+gen_ai.response.finish_reasons— "stop", "length", etc.
+gen_ai.usage.input_tokens     — prompt token count
+gen_ai.usage.output_tokens    — completion token count
+session.id                    — conversation session
 ```
+
+**Span events** (sensitive content — prompt/response text):
+```
+Event: gen_ai.content.prompt
+  Attribute: gen_ai.prompt     — JSON: [{"role":"user","content":"..."}]
+
+Event: gen_ai.content.completion
+  Attribute: gen_ai.completion — JSON: {"role":"assistant","content":"..."}
+```
+
+Content travels in span *events*, not attributes. This matches the GenAI spec
+and lets collectors redact sensitive content without stripping the span entirely.
+The stream processor's `processor.py` extracts text from these events.
 
 ### Classifier service design rules
 - Use a **sync `def` route** (not `async def`) for `/classify` — ONNX Runtime's `session.run()` is a blocking C call. Putting it in `async def` blocks the entire event loop.

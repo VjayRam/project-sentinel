@@ -3,7 +3,7 @@
 Consuming loop:
   1. Poll traces.raw for a batch of OTLP JSON messages.
   2. Parse each message to extract LLM spans (prompt + response text).
-  3. POST /classify/batch?persist=False — classifier returns labels without
+  3. POST /v1/moderations with persist=False — classifier returns labels without
      writing to PG itself (we handle PG writes here with span_id for idempotency).
   4. Write all results to PostgreSQL classifications.
   5. Write harm + sampled safe to MongoDB flagged_content.
@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import sys
+import time
 
 import httpx
 import psycopg
@@ -97,16 +98,21 @@ def run() -> None:
 
             # persist=False: skip classifier's own PG write; we write here with span_id.
             try:
-                resp = http.post("/classify/batch", json={"texts": texts, "persist": False})
+                t0 = time.perf_counter()
+                resp = http.post("/v1/moderations", json={"input": texts, "persist": False})
                 resp.raise_for_status()
+                classify_ms = (time.perf_counter() - t0) * 1000
                 body = resp.json()
             except Exception:
                 logger.exception("Classify failed — not committing, Kafka will redeliver")
                 continue
 
-            results = body["results"]
-            model_version = body["model_version"]
-            per_span_latency_ms = body["latency_ms"] / max(len(texts), 1)
+            model_version = body["model"]
+            results = [
+                {"label": "harm" if r["flagged"] else "safe", "score": r["category_scores"]["harm"]}
+                for r in body["results"]
+            ]
+            per_span_latency_ms = classify_ms / max(len(texts), 1)
 
             try:
                 write_classifications(pg_conn, spans, results, model_version, per_span_latency_ms)

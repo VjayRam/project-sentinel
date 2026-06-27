@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,11 @@ from schemas import (
     ClassifyRequest,
     ClassifyResponse,
     ClassifyResult,
+    ModerationCategories,
+    ModerationCategoryScores,
+    ModerationRequest,
+    ModerationResponse,
+    ModerationResult,
 )
 
 logging.basicConfig(
@@ -185,4 +191,45 @@ async def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse
         batch_size=len(request.texts),
         model_version=_classifier.model_version,
         inference_at=inference_at.isoformat(),
+    )
+
+
+@app.post("/v1/moderations", response_model=ModerationResponse)
+async def moderate(request: ModerationRequest) -> ModerationResponse:
+    """OpenAI Moderation API-compatible endpoint.
+
+    Accepts a single string or a list of strings and returns one ModerationResult
+    per input in the same order. Drop-in compatible with openai.moderations.create().
+    """
+    texts = [request.input] if isinstance(request.input, str) else list(request.input)
+
+    t0 = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(None, _classifier.predict, texts)
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    inference_at = datetime.now(timezone.utc)
+
+    BATCH_SIZE.observe(len(texts))
+    REQUEST_LATENCY.labels(endpoint="moderations").observe(latency_ms / 1000)
+    for r in results:
+        REQUEST_COUNT.labels(endpoint="moderations", label=r["label"]).inc()
+
+    if _pool and request.persist:
+        records = [
+            (text, r["label"], r["score"], _classifier.model_version, latency_ms, inference_at)
+            for text, r in zip(texts, results)
+        ]
+        asyncio.create_task(_persist_batch(records))
+
+    return ModerationResponse(
+        id=f"modr-{uuid.uuid4().hex[:12]}",
+        model=_classifier.model_version,
+        results=[
+            ModerationResult(
+                flagged=r["label"] == "harm",
+                categories=ModerationCategories(harm=r["label"] == "harm"),
+                category_scores=ModerationCategoryScores(harm=round(r["score"], 6)),
+            )
+            for r in results
+        ],
     )
