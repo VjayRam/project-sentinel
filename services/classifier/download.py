@@ -1,25 +1,22 @@
 import logging
-import os
 from pathlib import Path
 
 import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-# Local directory where downloaded models are cached between restarts.
-# Using /tmp so the cache is pod-local — each pod always downloads fresh
-# on the first request for a given version, then hits the cache after that.
-_CACHE_ROOT = Path(os.getenv("MODEL_CACHE_DIR", "/tmp/sentinel-model-cache"))
+_CACHE_ROOT = Path(settings.model_cache_dir)
 
 
 def _s3_client():
     return boto3.client(
         "s3",
-        endpoint_url=os.getenv("MINIO_ENDPOINT", "http://localhost:9000"),
-        aws_access_key_id=os.getenv("MINIO_ACCESS_KEY", "sentinel"),
-        aws_secret_access_key=os.getenv("MINIO_SECRET_KEY", "sentinel-minio"),
+        endpoint_url=settings.minio_endpoint,
+        aws_access_key_id=settings.minio_access_key,
+        aws_secret_access_key=settings.minio_secret_key,
         config=Config(
             signature_version="s3v4",
             connect_timeout=5,

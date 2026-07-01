@@ -7,6 +7,7 @@ MAX_BATCH_SIZE = 64
 
 # ── Internal classify API (kept for direct testing / backwards compat) ─────────
 
+
 class ClassifyRequest(BaseModel):
     text: str
 
@@ -38,6 +39,7 @@ class BatchClassifyResponse(BaseModel):
 # ── OpenAI Moderation API-compatible types ─────────────────────────────────────
 # POST /v1/moderations — primary public endpoint
 
+
 class ModerationCategories(BaseModel):
     harm: bool
 
@@ -60,6 +62,6 @@ class ModerationRequest(BaseModel):
 
 
 class ModerationResponse(BaseModel):
-    id: str          # "modr-<hex>" — unique request ID
-    model: str       # model version string
+    id: str  # "modr-<hex>" — unique request ID
+    model: str  # model version string
     results: list[ModerationResult]

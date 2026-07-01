@@ -11,4 +11,5 @@ dependencies = [
     "pydantic>=2.10",
     "asyncpg>=0.29",
     "boto3>=1.35",
+    "pydantic-settings>=2.3",
 ]

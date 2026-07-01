@@ -1,17 +1,14 @@
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+from config import settings
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
-
-_THRESHOLD = float(os.environ.get("CLASSIFY_THRESHOLD", "0.5"))
-_INTRA_THREADS = int(os.environ.get("ORT_INTRA_THREADS", "4"))
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -32,8 +29,8 @@ def _resolve_model_dir() -> tuple[Path, str, str | None]:
     source_model_id is the HuggingFace model ID from the optimizer report, or
     None when the path is supplied explicitly via MODEL_PATH.
     """
-    if model_path := os.environ.get("MODEL_PATH"):
-        p = Path(model_path)
+    if settings.model_path:
+        p = Path(settings.model_path)
         onnx_file = next(p.glob("*.onnx"), None)
         mtime = onnx_file.stat().st_mtime if onnx_file else None
         ts = datetime.fromtimestamp(mtime, tz=timezone.utc) if mtime else datetime.now(timezone.utc)
@@ -90,7 +87,7 @@ class Classifier:
             raise FileNotFoundError(f"No .onnx file in {model_dir}")
 
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = _INTRA_THREADS
+        opts.intra_op_num_threads = settings.ort_intra_threads
         opts.inter_op_num_threads = 1
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
@@ -106,7 +103,7 @@ class Classifier:
         self.model_id = source_model_id or config.get("_name_or_path") or str(model_dir)
         quant_tag = model_dir.name  # "int8", "o2", or "fp32"
         self.model_version = f"sentinel-roberta-{deployed_at}-{quant_tag}"
-        self.threshold = _THRESHOLD
+        self.threshold = settings.classify_threshold
         self.model_path = str(model_dir)
 
         logger.info(
@@ -114,8 +111,8 @@ class Classifier:
             self.model_id,
             self.model_version,
             model_file.name,
-            _INTRA_THREADS,
-            _THRESHOLD,
+            settings.ort_intra_threads,
+            settings.classify_threshold,
         )
 
     def warmup(self) -> None:
@@ -142,7 +139,7 @@ class Classifier:
             exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
             scores = (exp / exp.sum(axis=-1, keepdims=True))[:, -1]
 
-        labels = np.where(scores >= _THRESHOLD, "harm", "safe")
+        labels = np.where(scores >= settings.classify_threshold, "harm", "safe")
 
         return [
             {"label": str(label), "score": round(float(score), 4)}

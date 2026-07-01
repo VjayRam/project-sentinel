@@ -1,6 +1,6 @@
 import logging
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 REQUEST_COUNT = Counter(
     "classifier_requests_total",
@@ -19,6 +19,11 @@ BATCH_SIZE = Histogram(
     "classifier_batch_size",
     "Number of texts per batch request",
     buckets=[1, 2, 4, 8, 16, 32, 64],
+)
+
+QUEUE_DEPTH = Gauge(
+    "classifier_queue_depth",
+    "Current number of requests waiting in the batcher queue",
 )
 
 LOG_ERRORS = Counter(

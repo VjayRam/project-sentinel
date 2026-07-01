@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -9,8 +8,9 @@ from pathlib import Path
 
 import db as _db
 from batcher import DynamicBatcher
+from config import settings
 from download import download_model
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from metrics import BATCH_SIZE, REQUEST_COUNT, REQUEST_LATENCY, attach_log_handler
 from model import Classifier
 from prometheus_client import make_asgi_app
@@ -38,21 +38,21 @@ logger = logging.getLogger(__name__)
 _classifier: Classifier | None = None
 _batcher: DynamicBatcher | None = None
 _pool = None
+_ready: bool = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _classifier, _batcher, _pool
+    global _classifier, _batcher, _pool, _ready
 
     # ── 1. Connect to DB and resolve the active model from the registry ────────
     # The registry is the source of truth for which model version to serve.
     # Open the pool first so we can query it before loading the model.
     model_dir: Path | None = None
-    dsn = os.environ.get("DATABASE_URL")
 
-    if dsn:
+    if settings.database_url:
         try:
-            _pool = await _db.init_pool(dsn)
+            _pool = await _db.init_pool(settings.database_url)
             active = await _db.get_active_model(_pool)
             if active:
                 # download_model is blocking boto3 I/O — offload to a thread so
@@ -94,8 +94,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to register model version in registry")
 
+    # ── 4. Signal readiness — pod now accepts traffic ─────────────────────────
+    _ready = True
+
     yield
 
+    # ── Shutdown: stop accepting traffic before tearing down ──────────────────
+    _ready = False
     _batcher.stop()
     if _pool:
         await _db.close_pool(_pool)
@@ -106,8 +111,15 @@ app = FastAPI(title="Sentinel Classifier", version="1.0.0", lifespan=lifespan)
 app.mount("/metrics", make_asgi_app())
 
 
-@app.get("/health")
-def health() -> dict:
+@app.get("/health/live")
+def liveness() -> dict:
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def readiness() -> dict:
+    if not _ready:
+        raise HTTPException(status_code=503, detail="not ready")
     return {"status": "ok", "model": _classifier.model_id if _classifier else None}
 
 
@@ -137,7 +149,10 @@ async def _persist_batch(records: list[tuple]) -> None:
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify(request: ClassifyRequest) -> ClassifyResponse:
     t0 = time.perf_counter()
-    result = await _batcher.submit(request.text)
+    try:
+        result = await _batcher.submit(request.text)
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=503, detail="classifier queue full — retry later")
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     inference_at = datetime.now(timezone.utc)
 
