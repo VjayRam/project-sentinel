@@ -1505,3 +1505,317 @@ resource "kubernetes_service" "otel_collector" {
     type = "ClusterIP"
   }
 }
+
+# ── App-layer secrets (sentinel-app) ─────────────────────────────────────────
+# K8s secrets are namespace-scoped. The data-layer secrets live in sentinel-data
+# and are unreachable from sentinel-app pods. Mirror the needed credentials here
+# using the same variable values — single source of truth stays in variables.tf.
+
+resource "kubernetes_secret" "app_postgres" {
+  metadata {
+    name      = "postgresql-credentials"
+    namespace = kubernetes_namespace.sentinel["sentinel-app"].metadata[0].name
+  }
+  data = {
+    password = var.postgres_password
+  }
+}
+
+resource "kubernetes_secret" "app_minio" {
+  metadata {
+    name      = "minio-credentials"
+    namespace = kubernetes_namespace.sentinel["sentinel-app"].metadata[0].name
+  }
+  data = {
+    root-user     = var.minio_root_user
+    root-password = var.minio_root_password
+  }
+}
+
+resource "kubernetes_secret" "app_mongodb" {
+  metadata {
+    name      = "mongodb-credentials"
+    namespace = kubernetes_namespace.sentinel["sentinel-app"].metadata[0].name
+  }
+  data = {
+    sentinel-password = var.mongodb_password
+  }
+}
+
+# ── Classifier (sentinel-app) ─────────────────────────────────────────────────
+# Image is built locally and imported into k3d by dev-start.sh before apply.
+# imagePullPolicy=Never tells K8s to use the local image store only — no registry.
+# wait_for_rollout=false because on the very first apply the image may not exist
+# yet (dev-start.sh imports it then does a rollout restart).
+# Env vars use K8s $(VAR) substitution to inject secret values into DSN strings.
+
+resource "kubernetes_deployment" "classifier" {
+  metadata {
+    name      = "classifier"
+    namespace = kubernetes_namespace.sentinel["sentinel-app"].metadata[0].name
+    labels    = { app = "classifier" }
+  }
+
+  spec {
+    replicas = 1
+
+    selector { match_labels = { app = "classifier" } }
+
+    template {
+      metadata { labels = { app = "classifier" } }
+
+      spec {
+        container {
+          name              = "classifier"
+          image             = "sentinel-classifier:local"
+          image_pull_policy = "Never"
+
+          env {
+            name = "PG_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.app_postgres.metadata[0].name
+                key  = "password"
+              }
+            }
+          }
+          env {
+            name  = "DATABASE_URL"
+            value = "postgresql://sentinel:$(PG_PASSWORD)@postgresql.sentinel-data.svc.cluster.local:5432/sentinel"
+          }
+          env {
+            name  = "MINIO_ENDPOINT"
+            value = "http://minio.sentinel-data.svc.cluster.local:9000"
+          }
+          env {
+            name = "MINIO_ACCESS_KEY"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.app_minio.metadata[0].name
+                key  = "root-user"
+              }
+            }
+          }
+          env {
+            name = "MINIO_SECRET_KEY"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.app_minio.metadata[0].name
+                key  = "root-password"
+              }
+            }
+          }
+
+          port { container_port = 8000 }
+
+          liveness_probe {
+            http_get {
+              path = "/health/live"
+              port = 8000
+            }
+            initial_delay_seconds = 5
+            period_seconds        = 10
+            failure_threshold     = 3
+          }
+
+          readiness_probe {
+            http_get {
+              path = "/health/ready"
+              port = 8000
+            }
+            initial_delay_seconds = 15
+            period_seconds        = 5
+            failure_threshold     = 6
+          }
+
+          resources {
+            requests = { cpu = "200m", memory = "256Mi" }
+            limits   = { cpu = "1000m", memory = "1Gi" }
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = false
+
+  timeouts {
+    create = "5m"
+    update = "5m"
+  }
+}
+
+# ── Phase 6: Spark on Kubernetes ──────────────────────────────────────────────
+
+# spark-on-k8s-operator watches sentinel-pipeline for SparkApplication CRDs
+# and submits them to the cluster as driver + executor pods.
+resource "helm_release" "spark_operator" {
+  name             = "spark-operator"
+  repository       = "https://kubeflow.github.io/spark-operator"
+  chart            = "spark-operator"
+  version          = "~2.1"
+  namespace        = kubernetes_namespace.sentinel["sentinel-pipeline"].metadata[0].name
+  create_namespace = false
+  wait             = true
+
+  values = [yamlencode({
+    controller = {
+      workers = 1
+    }
+    webhook = {
+      enable = true
+    }
+    spark = {
+      jobNamespaces = ["sentinel-pipeline"]
+    }
+  })]
+}
+
+# ServiceAccount the driver pod runs as — must have permission to create/delete
+# executor pods within sentinel-pipeline.
+resource "kubernetes_service_account" "spark" {
+  metadata {
+    name      = "spark"
+    namespace = kubernetes_namespace.sentinel["sentinel-pipeline"].metadata[0].name
+  }
+}
+
+resource "kubernetes_role" "spark_driver" {
+  metadata {
+    name      = "spark-driver"
+    namespace = kubernetes_namespace.sentinel["sentinel-pipeline"].metadata[0].name
+  }
+  rule {
+    api_groups = [""]
+    resources  = ["pods", "services", "configmaps", "persistentvolumeclaims"]
+    verbs      = ["create", "get", "list", "watch", "delete", "deletecollection", "update", "patch"]
+  }
+}
+
+resource "kubernetes_role_binding" "spark_driver" {
+  metadata {
+    name      = "spark-driver"
+    namespace = kubernetes_namespace.sentinel["sentinel-pipeline"].metadata[0].name
+  }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "Role"
+    name      = kubernetes_role.spark_driver.metadata[0].name
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account.spark.metadata[0].name
+    namespace = kubernetes_namespace.sentinel["sentinel-pipeline"].metadata[0].name
+  }
+}
+
+# PostgreSQL DSN for the drift driver pod — identical pattern to app_postgres
+# but in sentinel-pipeline namespace (secrets are namespace-scoped).
+resource "kubernetes_secret" "drift_postgres" {
+  metadata {
+    name      = "drift-postgres"
+    namespace = kubernetes_namespace.sentinel["sentinel-pipeline"].metadata[0].name
+  }
+  data = {
+    database-url = "postgresql://sentinel:${var.postgres_password}@postgresql.sentinel-data.svc.cluster.local:5432/sentinel"
+  }
+}
+
+resource "kubernetes_service" "classifier" {
+  metadata {
+    name      = "classifier"
+    namespace = kubernetes_namespace.sentinel["sentinel-app"].metadata[0].name
+  }
+
+  spec {
+    selector = { app = "classifier" }
+    port {
+      port        = 8000
+      target_port = 8000
+    }
+    type = "ClusterIP"
+  }
+}
+
+# ── Stream Processor (sentinel-app) ───────────────────────────────────────────
+# Consumer only — no Service needed (nothing calls into it).
+# Connects to Kafka via PLAINTEXT in-cluster listener (no port-forward needed).
+# Connects to classifier via in-cluster DNS — no port-forward needed.
+# Replicas: max 3 (one per Kafka partition). Scaling beyond 3 gives zero benefit.
+
+resource "kubernetes_deployment" "stream_processor" {
+  metadata {
+    name      = "stream-processor"
+    namespace = kubernetes_namespace.sentinel["sentinel-app"].metadata[0].name
+    labels    = { app = "stream-processor" }
+  }
+
+  spec {
+    replicas = 1
+
+    selector { match_labels = { app = "stream-processor" } }
+
+    template {
+      metadata { labels = { app = "stream-processor" } }
+
+      spec {
+        container {
+          name              = "stream-processor"
+          image             = "sentinel-stream-processor:local"
+          image_pull_policy = "Never"
+
+          env {
+            name  = "KAFKA_BOOTSTRAP_SERVERS"
+            value = "kafka.sentinel-data.svc.cluster.local:9092"
+          }
+          env {
+            name  = "CLASSIFIER_URL"
+            value = "http://classifier.sentinel-app.svc.cluster.local:8000"
+          }
+          env {
+            name = "PG_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.app_postgres.metadata[0].name
+                key  = "password"
+              }
+            }
+          }
+          env {
+            name  = "DATABASE_URL"
+            value = "postgresql://sentinel:$(PG_PASSWORD)@postgresql.sentinel-data.svc.cluster.local:5432/sentinel"
+          }
+          env {
+            name = "MONGO_PASSWORD"
+            value_from {
+              secret_key_ref {
+                name = kubernetes_secret.app_mongodb.metadata[0].name
+                key  = "sentinel-password"
+              }
+            }
+          }
+          env {
+            name  = "MONGO_URI"
+            value = "mongodb://sentinel:$(MONGO_PASSWORD)@mongodb.sentinel-data.svc.cluster.local:27017/sentinel"
+          }
+          env {
+            name  = "SAFE_SAMPLE_RATE"
+            value = "0.1"
+          }
+
+          resources {
+            requests = { cpu = "100m", memory = "128Mi" }
+            limits   = { cpu = "500m", memory = "256Mi" }
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = false
+
+  timeouts {
+    create = "5m"
+    update = "5m"
+  }
+}

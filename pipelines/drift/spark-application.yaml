@@ -1,0 +1,43 @@
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: sentinel-drift
+  namespace: sentinel-pipeline
+spec:
+  type: Python
+  pythonVersion: "3"
+  mode: cluster
+  image: sentinel-drift:local
+  imagePullPolicy: Never
+  mainApplicationFile: local:///opt/spark/work-dir/drift_job.py
+  arguments:
+    - "--hours"
+    - "24"
+    - "--reference-size"
+    - "1000"
+  sparkVersion: "3.5.3"
+  restartPolicy:
+    type: Never
+  driver:
+    cores: 1
+    coreLimit: "1200m"
+    memory: "512m"
+    serviceAccount: spark
+    env:
+      - name: DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: drift-postgres
+            key: database-url
+      # apache/spark-py sets PYSPARK_PYTHON to /usr/bin/python3
+      - name: PYSPARK_PYTHON
+        value: /usr/bin/python3
+      - name: PYSPARK_DRIVER_PYTHON
+        value: /usr/bin/python3
+  executor:
+    cores: 1
+    instances: 2
+    memory: "512m"
+    env:
+      - name: PYSPARK_PYTHON
+        value: /usr/bin/python3

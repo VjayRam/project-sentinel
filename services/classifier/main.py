@@ -39,6 +39,7 @@ _classifier: Classifier | None = None
 _batcher: DynamicBatcher | None = None
 _pool = None
 _ready: bool = False
+_persist_tasks: set[asyncio.Task] = set()
 
 
 @asynccontextmanager
@@ -103,6 +104,11 @@ async def lifespan(app: FastAPI):
     _ready = False
     _batcher.stop()
     if _pool:
+        # Drain any in-flight fire-and-forget persist tasks before closing the
+        # pool — without this, classifications written during the last few
+        # requests are silently dropped when the event loop stops.
+        if _persist_tasks:
+            await asyncio.gather(*_persist_tasks, return_exceptions=True)
         await _db.close_pool(_pool)
     _classifier = None
 
@@ -160,7 +166,7 @@ async def classify(request: ClassifyRequest) -> ClassifyResponse:
     REQUEST_LATENCY.labels(endpoint="classify").observe(latency_ms / 1000)
 
     if _pool:
-        asyncio.create_task(
+        task = asyncio.create_task(
             _persist_single(
                 request.text,
                 result["label"],
@@ -170,6 +176,8 @@ async def classify(request: ClassifyRequest) -> ClassifyResponse:
                 inference_at,
             )
         )
+        _persist_tasks.add(task)
+        task.add_done_callback(_persist_tasks.discard)
 
     return ClassifyResponse(
         latency_ms=latency_ms,
@@ -198,7 +206,9 @@ async def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse
             (text, r["label"], r["score"], _classifier.model_version, latency_ms, inference_at)
             for text, r in zip(request.texts, results)
         ]
-        asyncio.create_task(_persist_batch(records))
+        task = asyncio.create_task(_persist_batch(records))
+        _persist_tasks.add(task)
+        task.add_done_callback(_persist_tasks.discard)
 
     return BatchClassifyResponse(
         results=[ClassifyResult(**r) for r in results],
@@ -234,7 +244,9 @@ async def moderate(request: ModerationRequest) -> ModerationResponse:
             (text, r["label"], r["score"], _classifier.model_version, latency_ms, inference_at)
             for text, r in zip(texts, results)
         ]
-        asyncio.create_task(_persist_batch(records))
+        task = asyncio.create_task(_persist_batch(records))
+        _persist_tasks.add(task)
+        task.add_done_callback(_persist_tasks.discard)
 
     return ModerationResponse(
         id=f"modr-{uuid.uuid4().hex[:12]}",

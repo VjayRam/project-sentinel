@@ -497,12 +497,12 @@ wheels = [
 ]
 
 [[package]]
-name = "kafka-python"
-version = "3.0.6"
+name = "kafka-python-ng"
+version = "2.2.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/41/f9/5a44953b12b44501969ffb143b5f62bac137c05073f1d3cc97f35786c1da/kafka_python-3.0.6.tar.gz", hash = "sha256:4723f06e6989956cb4ee4e210442d5f7ec716acd59f961070e39a429c50d696e", size = 511557, upload-time = "2026-06-25T19:09:17.982Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ce/04/1d65bdf3f0103a08710e226b851de4b357ac702f1cadabf6128bab7518a7/kafka_python_ng-2.2.3.tar.gz", hash = "sha256:f79f28e10ade9b5a9860b2ec15b7cc8dc510d5702f5a399430478cff5f93a05a", size = 330644, upload-time = "2024-10-02T16:56:58.639Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9e/3a/7e5fd7b0f324d211da6c3267df7d823745cbb6189e38135d370e1944f5a6/kafka_python-3.0.6-py3-none-any.whl", hash = "sha256:fdaabef28fe3a67fcd59d3637873505922c8f1b0e6f14fc3014bdd60ff615e44", size = 613857, upload-time = "2026-06-25T19:09:21.388Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/61/22e778f642465a157c449782300d8817ebbc106794a8a7ebe88cbb846b05/kafka_python_ng-2.2.3-py2.py3-none-any.whl", hash = "sha256:adc6e82147c441ca4ae1f22e291fc08efab0d10971cbd4aa1481d2ffa38e9480", size = 232824, upload-time = "2024-10-02T16:56:56.932Z" },
 ]
 
 [[package]]
@@ -1534,7 +1534,7 @@ version = "0.1.0"
 source = { virtual = "services/stream-processor" }
 dependencies = [
     { name = "httpx" },
-    { name = "kafka-python" },
+    { name = "kafka-python-ng" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pymongo" },
 ]
@@ -1542,7 +1542,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
-    { name = "kafka-python", specifier = ">=2.0" },
+    { name = "kafka-python-ng", specifier = ">=2.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pymongo", specifier = ">=4.0" },
 ]

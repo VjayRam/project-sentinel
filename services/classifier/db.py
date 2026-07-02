@@ -60,7 +60,7 @@ async def register_model(
     await pool.execute(
         """
         INSERT INTO model_registry (model_version, model_path, threshold, status)
-        VALUES ($1, $2, $3, 'active')
+        VALUES ($1, $2, $3, 'staging')
         ON CONFLICT (model_version) DO NOTHING
         """,
         model_version,

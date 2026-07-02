@@ -15,14 +15,12 @@ import json
 import logging
 import os
 import signal
-import sys
 import time
 
 import httpx
 import psycopg
 import pymongo
 from kafka import KafkaConsumer
-
 from processor import extract_spans
 from writer import write_classifications, write_flagged_content
 
@@ -36,7 +34,9 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9094")
 TOPIC = "traces.raw"
 GROUP_ID = "sentinel-stream-processor"
 CLASSIFIER_URL = os.environ.get("CLASSIFIER_URL", "http://localhost:8000")
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://sentinel:sentinel@localhost:5432/sentinel")
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://sentinel:sentinel@localhost:5432/sentinel"
+)
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://sentinel:sentinel@localhost:27017/sentinel")
 SAFE_SAMPLE_RATE = float(os.environ.get("SAFE_SAMPLE_RATE", "0.1"))
 MAX_POLL_RECORDS = int(os.environ.get("MAX_POLL_RECORDS", "50"))
@@ -50,11 +50,47 @@ def _handle_signal(sig, frame):
     _running = False
 
 
+def _pg_connect() -> psycopg.Connection:
+    conn = psycopg.connect(DATABASE_URL)
+    logger.info("PostgreSQL connected")
+    return conn
+
+
+def _pg_write(
+    pg_conn: psycopg.Connection,
+    spans: list[dict],
+    results: list[dict],
+    model_version: str,
+    latency_ms: float,
+    mongo_db,
+) -> psycopg.Connection:
+    """Write to PostgreSQL and MongoDB, reconnecting once on connection failure.
+
+    Returns the (possibly new) connection so the caller can update its reference.
+    Raises on failure so the caller knows not to commit the Kafka offset.
+    ON CONFLICT DO NOTHING on (span_id, text_type) makes the retry idempotent.
+    """
+    try:
+        write_classifications(pg_conn, spans, results, model_version, latency_ms)
+        write_flagged_content(mongo_db, spans, results, model_version, SAFE_SAMPLE_RATE)
+        return pg_conn
+    except psycopg.OperationalError:
+        logger.warning("PostgreSQL connection lost — reconnecting and retrying once")
+        try:
+            pg_conn.close()
+        except Exception:
+            pass
+        pg_conn = _pg_connect()
+        write_classifications(pg_conn, spans, results, model_version, latency_ms)
+        write_flagged_content(mongo_db, spans, results, model_version, SAFE_SAMPLE_RATE)
+        return pg_conn
+
+
 def run() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    pg_conn = psycopg.connect(DATABASE_URL)
+    pg_conn = _pg_connect()
     mongo_db = pymongo.MongoClient(MONGO_URI).sentinel
 
     consumer = KafkaConsumer(
@@ -64,7 +100,7 @@ def run() -> None:
         enable_auto_commit=False,
         auto_offset_reset="earliest",
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-        request_timeout_ms=30_000,
+        request_timeout_ms=40_000,
         session_timeout_ms=30_000,
         heartbeat_interval_ms=10_000,
     )
@@ -99,7 +135,7 @@ def run() -> None:
             # Chunk texts to stay within MAX_BATCH_SIZE (64) per request.
             # A single Kafka poll can accumulate many spans across multiple messages.
             CHUNK = 64
-            chunks = [texts[i:i + CHUNK] for i in range(0, len(texts), CHUNK)]
+            chunks = [texts[i : i + CHUNK] for i in range(0, len(texts), CHUNK)]
 
             # persist=False: skip classifier's own PG write; we write here with span_id.
             all_results: list[dict] = []
@@ -112,26 +148,31 @@ def run() -> None:
                     if not resp.is_success:
                         logger.error(
                             "Classify HTTP %d — body: %s | chunk=%d texts",
-                            resp.status_code, resp.text[:300], len(chunk),
+                            resp.status_code,
+                            resp.text[:300],
+                            len(chunk),
                         )
                     resp.raise_for_status()
                     classify_ms_total += (time.perf_counter() - t0) * 1000
                     body = resp.json()
                     model_version = body["model"]
                     all_results.extend(
-                        {"label": "harm" if r["flagged"] else "safe", "score": r["category_scores"]["harm"]}
+                        {
+                            "label": "harm" if r["flagged"] else "safe",
+                            "score": r["category_scores"]["harm"],
+                        }
                         for r in body["results"]
                     )
             except Exception:
                 logger.exception("Classify failed — not committing, Kafka will redeliver")
                 continue
 
-            results = all_results
             per_span_latency_ms = classify_ms_total / max(len(texts), 1)
 
             try:
-                write_classifications(pg_conn, spans, results, model_version, per_span_latency_ms)
-                write_flagged_content(mongo_db, spans, results, model_version, SAFE_SAMPLE_RATE)
+                pg_conn = _pg_write(
+                    pg_conn, spans, all_results, model_version, per_span_latency_ms, mongo_db
+                )
             except Exception:
                 logger.exception("DB write failed — not committing, Kafka will redeliver")
                 continue
@@ -140,7 +181,8 @@ def run() -> None:
             logger.info("Committed offset after processing %d spans", len(spans))
 
     consumer.close()
-    pg_conn.close()
+    if not pg_conn.closed:
+        pg_conn.close()
     logger.info("Stream processor stopped")
 
 
