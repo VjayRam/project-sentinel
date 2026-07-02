@@ -57,10 +57,16 @@ def write_flagged_content(
     model_version: str,
     safe_sample_rate: float,
 ) -> None:
-    """Write harm spans (+ safe_sample_rate fraction of safe) to flagged_content.
+    """Write harm spans (+ safe_sample_rate fraction of safe) to flagged_content
+    with at-most-once semantics per (span_id, text_type), mirroring the
+    ON CONFLICT DO NOTHING behavior of write_classifications.
 
-    Storing a sample of safe content alongside harm prevents class imbalance
-    in the retraining dataset — the retrain pipeline draws from this collection.
+    A plain insert_many here would duplicate documents on Kafka redelivery: a
+    mid-batch failure (ordered=True stops partway through, or any exception
+    after some docs already landed) leaves the offset uncommitted, so the same
+    batch gets reprocessed and re-inserted with no dedup. Upserting on
+    (span_id, text_type) — the same natural key as the classifications unique
+    index — makes redelivery a no-op instead of a duplicate.
     """
     now = datetime.now(timezone.utc)
     docs = []
@@ -81,6 +87,29 @@ def write_flagged_content(
                     "llm_model": span["llm_model"],
                 }
             )
-    if docs:
-        db.flagged_content.insert_many(docs)
-        logger.info("Wrote %d documents to flagged_content", len(docs))
+    if not docs:
+        return
+
+    # Spans without a span_id have no natural key to dedupe on (same gap that
+    # already exists for classifications' partial unique index) — insert
+    # those directly; upsert the rest keyed on (span_id, text_type).
+    operations = [
+        pymongo.UpdateOne(
+            {"span_id": doc["span_id"], "text_type": doc["text_type"]},
+            {"$set": doc},
+            upsert=True,
+        )
+        if doc["span_id"]
+        else pymongo.InsertOne(doc)
+        for doc in docs
+    ]
+    # ordered=False: one bad op doesn't block the rest from committing, so a
+    # partial failure leaves only genuinely-failed docs to retry — everything
+    # else is already a safe upsert and won't duplicate on redelivery.
+    result = db.flagged_content.bulk_write(operations, ordered=False)
+    logger.info(
+        "flagged_content write | upserted=%d modified=%d inserted=%d",
+        len(result.upserted_ids),
+        result.modified_count,
+        result.inserted_count,
+    )

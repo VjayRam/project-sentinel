@@ -35,6 +35,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Below this many reference rows, epsilon-smoothing dominates the reference
+# histogram and PSI/JSD against it are not statistically meaningful.
+MIN_REFERENCE_SIZE = 10
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Sentinel drift detection job")
@@ -93,12 +97,21 @@ def main() -> None:
     ref_scores = read_reference_scores(
         args.database_url, model_version, size=args.reference_size
     )
-    if len(ref_scores) < 10:
+    if len(ref_scores) < MIN_REFERENCE_SIZE:
+        # Too few rows to build a meaningful reference distribution — with this
+        # little data, epsilon-smoothing dominates the reference histogram and
+        # PSI/JSD against it are not trustworthy. Skip rather than risk writing
+        # a false drift_flagged=True (which would fire an unwarranted retrain
+        # once this is wired into Phase 7 automation).
         logger.warning(
-            "Only %d reference rows for model %s — need at least 10 for reliable PSI",
+            "Only %d reference rows for model %s — need at least %d for reliable "
+            "PSI; skipping this run rather than compute drift against an unreliable "
+            "baseline",
             len(ref_scores),
             model_version,
+            MIN_REFERENCE_SIZE,
         )
+        sys.exit(0)
 
     cur_scores, window_start, window_end = read_current_scores(
         args.database_url, model_version, hours=args.hours

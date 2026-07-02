@@ -198,32 +198,13 @@ wait_for_port "Grafana"        3000  grafana
 wait_for_port "Jaeger"         16686 jaeger
 wait_for_port "OTel Collector" 4317  otel-collector
 
-# ── schema migration ──────────────────────────────────────────────────────────
-info "Running schema migrations..."
-psql "$DATABASE_URL" <<'SQL' >/dev/null 2>&1
-    ALTER TABLE classifications ADD COLUMN IF NOT EXISTS span_id   TEXT;
-    ALTER TABLE classifications ADD COLUMN IF NOT EXISTS text_type VARCHAR(8);
-    CREATE UNIQUE INDEX IF NOT EXISTS classifications_span_id_text_type_idx
-        ON classifications (span_id, text_type)
-        WHERE span_id IS NOT NULL;
-
-    CREATE TABLE IF NOT EXISTS drift_stats (
-        id             BIGSERIAL PRIMARY KEY,
-        computed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        model_version  VARCHAR(100) NOT NULL,
-        window_start   TIMESTAMPTZ NOT NULL,
-        window_end     TIMESTAMPTZ NOT NULL,
-        n_samples      INT NOT NULL,
-        psi            FLOAT NOT NULL,
-        jsd            FLOAT NOT NULL,
-        drift_flagged  BOOLEAN NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS drift_stats_computed_at_idx
-        ON drift_stats (computed_at DESC);
-    CREATE INDEX IF NOT EXISTS drift_stats_model_version_idx
-        ON drift_stats (model_version, computed_at DESC);
-SQL
-info "Schema up-to-date" || warn "Schema migration failed — check $PF_DIR/postgres.log"
+# ── schema ─────────────────────────────────────────────────────────────────────
+# Schema (model_registry, classifications, drift_stats, and all indexes) is
+# fully owned by Terraform's postgres_init ConfigMap (01_schema.sql) — it runs
+# automatically on the postgres pod's first startup. No separate migration step
+# needed here; keeping schema definitions in one place avoids them drifting
+# apart (see: the drift_stats table used to only exist via this script).
+info "Schema managed by Terraform — nothing to migrate"
 
 # ── model auto-bootstrap ──────────────────────────────────────────────────────
 # The classifier pod needs a model in MinIO to start. Run the optimizer locally

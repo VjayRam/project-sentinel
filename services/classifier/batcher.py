@@ -39,9 +39,22 @@ class DynamicBatcher:
             settings.max_queue_depth,
         )
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+        # Anything still sitting in the queue was never picked up by the loop
+        # at all (no batch was formed yet) — fail it the same way so callers
+        # don't hang forever waiting on a future nothing will ever resolve.
+        while not self._queue.empty():
+            pending = self._queue.get_nowait()
+            if not pending.future.done():
+                pending.future.set_exception(RuntimeError("DynamicBatcher is shutting down"))
 
     async def submit(self, text: str) -> dict:
         loop = asyncio.get_running_loop()
@@ -79,7 +92,17 @@ class DynamicBatcher:
                 for pending, result in zip(batch, results):
                     if not pending.future.done():
                         pending.future.set_result(result)
+            except asyncio.CancelledError:
+                # stop() cancelled us mid-batch — fail whatever we already
+                # pulled off the queue instead of leaving those callers to
+                # hang forever, then propagate so the task actually stops.
+                self._fail_all(batch, RuntimeError("DynamicBatcher is shutting down"))
+                raise
             except Exception as exc:
-                for pending in batch:
-                    if not pending.future.done():
-                        pending.future.set_exception(exc)
+                self._fail_all(batch, exc)
+
+    @staticmethod
+    def _fail_all(batch: list["_Pending"], exc: BaseException) -> None:
+        for pending in batch:
+            if not pending.future.done():
+                pending.future.set_exception(exc)

@@ -122,19 +122,25 @@ def write_drift_stats(
 
 
 def get_active_model_version(database_url: str) -> str | None:
-    """Return the model_version string most recently written to classifications.
+    """Return the model_version model_registry considers current.
 
-    The classifier computes its own version string (sentinel-roberta-{ts}-int8)
-    at load time and registers it as 'staging'. model_registry's 'active' row
-    tracks the MinIO path entry, not the classifier's self-reported version.
-    Querying classifications directly gives us the version that is actually
-    running and whose rows we want to evaluate for drift.
+    Mirrors services/classifier/db.py's get_active_model selection exactly
+    (prefer status='active', fall back to the most recent 'staging' entry) so
+    the drift job evaluates the same version a classifier pod would load on
+    startup. Reading from `classifications` instead (whichever version wrote
+    the most recent row) was a race during rolling restarts: old- and
+    new-version pods write concurrently, so "most recent row" doesn't mean
+    "the rollout's target version" — it could attribute drift_stats to a
+    version that's already being retired.
     """
     with _connect(database_url) as conn:
         row = conn.execute(
             """
-            SELECT model_version FROM classifications
-            ORDER BY ts DESC
+            SELECT model_version FROM model_registry
+            WHERE status IN ('active', 'staging')
+            ORDER BY
+                CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                COALESCE(promoted_at, created_at) DESC
             LIMIT 1
             """,
         ).fetchone()

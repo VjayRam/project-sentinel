@@ -14,6 +14,8 @@ logs/
 artifacts/
 *.parquet
 *.csv
+# Ground-truth eval fixture for pipelines/evaluation — not generated output.
+!datasets/test_dataset.csv
 .DS_Store
 .claude/
 .venv/

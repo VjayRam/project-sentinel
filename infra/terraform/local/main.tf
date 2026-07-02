@@ -86,6 +86,24 @@ resource "kubernetes_config_map" "postgres_init" {
       CREATE UNIQUE INDEX IF NOT EXISTS classifications_span_id_text_type_idx
           ON classifications (span_id, text_type)
           WHERE span_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS drift_stats (
+          id             BIGSERIAL    PRIMARY KEY,
+          computed_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+          model_version  VARCHAR(100) NOT NULL,
+          window_start   TIMESTAMPTZ  NOT NULL,
+          window_end     TIMESTAMPTZ  NOT NULL,
+          n_samples      INT          NOT NULL,
+          psi            FLOAT        NOT NULL,
+          jsd            FLOAT        NOT NULL,
+          drift_flagged  BOOLEAN      NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS drift_stats_computed_at_idx
+          ON drift_stats (computed_at DESC);
+
+      CREATE INDEX IF NOT EXISTS drift_stats_model_version_idx
+          ON drift_stats (model_version, computed_at DESC);
     SQL
   }
 }
@@ -254,6 +272,14 @@ resource "kubernetes_config_map" "mongodb_init" {
       db.flagged_content.createIndex({ ts: -1 });
       db.flagged_content.createIndex({ label: 1, ts: -1 });
       db.flagged_content.createIndex({ model_version: 1, ts: -1 });
+
+      // Mirrors the partial unique index on classifications (span_id, text_type)
+      // in Postgres — enforces idempotency at the DB level so Kafka redelivery
+      // can't duplicate a flagged_content doc, even if application code regresses.
+      db.flagged_content.createIndex(
+        { span_id: 1, text_type: 1 },
+        { unique: true, partialFilterExpression: { span_id: { '$type': 'string' } } }
+      );
     JS
   }
 }
@@ -1092,6 +1118,13 @@ resource "kubernetes_stateful_set" "kafka" {
           env {
             name  = "KAFKA_PROCESS_ROLES"
             value = "broker,controller"
+          }
+          env {
+            # apache/kafka's default log.dirs is /tmp/kraft-combined-logs, which is
+            # NOT under the mounted PVC (see volume_mount below) — without this,
+            # topic data silently doesn't survive pod restarts/reschedules.
+            name  = "KAFKA_LOG_DIRS"
+            value = "/bitnami/kafka/data"
           }
           env {
             name  = "KAFKA_CONTROLLER_QUORUM_VOTERS"

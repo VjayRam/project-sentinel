@@ -102,7 +102,7 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown: stop accepting traffic before tearing down ──────────────────
     _ready = False
-    _batcher.stop()
+    await _batcher.stop()
     if _pool:
         # Drain any in-flight fire-and-forget persist tasks before closing the
         # pool — without this, classifications written during the last few
