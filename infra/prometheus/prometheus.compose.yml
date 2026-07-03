@@ -1,0 +1,34 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: local-compose
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files:
+  - rules/classifier.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: classifier
+    metrics_path: /metrics/
+    scrape_interval: 10s
+    static_configs:
+      # docker-compose service name (compose bridge network) — NOT the same
+      # target as prometheus.yml's k8s FQDN. See prometheus.yml's comment:
+      # these are deliberately two separate config files, one per runtime,
+      # rather than one file listing both targets — a single shared file
+      # would leave one target permanently down in every environment,
+      # which makes the ClassifierDown alert (up{job="classifier"} == 0)
+      # fire constantly regardless of whether the classifier is healthy.
+      - targets: ["classifier:8000"]
+    relabel_configs:
+      - target_label: service
+        replacement: classifier

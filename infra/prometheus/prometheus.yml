@@ -18,14 +18,15 @@ scrape_configs:
       - targets: ["localhost:9090"]
 
   - job_name: classifier
-    # host.k3d.internal resolves to the Docker host from inside k3d pods,
-    # allowing Prometheus to scrape the classifier running locally via dev-start.sh.
-    # Change to classifier.sentinel-app.svc.cluster.local:8000 when the
-    # classifier is deployed into the cluster (Phase 5+).
     metrics_path: /metrics/
     scrape_interval: 10s
     static_configs:
-      - targets: ["host.k3d.internal:8000"]
+      # k8s-internal Service FQDN — only resolves inside the cluster. The
+      # docker-compose dev path uses prometheus.compose.yml instead (its
+      # target is the compose network's "classifier:8000"), rather than
+      # listing both targets here — that would leave one permanently down
+      # in every environment and make the ClassifierDown alert fire nonstop.
+      - targets: ["classifier.sentinel-app.svc.cluster.local:8000"]
     relabel_configs:
       - target_label: service
         replacement: classifier

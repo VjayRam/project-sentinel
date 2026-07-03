@@ -1,17 +1,14 @@
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+from config import settings
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
-
-_THRESHOLD = float(os.environ.get("CLASSIFY_THRESHOLD", "0.5"))
-_INTRA_THREADS = int(os.environ.get("ORT_INTRA_THREADS", "4"))
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -26,32 +23,39 @@ def _project_root() -> Path:
     return here
 
 
+def _deployed_at_from_dir(model_dir: Path) -> str:
+    """Derive a deployed_at timestamp string from a model directory's .onnx
+    file mtime, falling back to now() if no .onnx file is present yet.
+    """
+    onnx_file = next(model_dir.glob("*.onnx"), None)
+    mtime = onnx_file.stat().st_mtime if onnx_file else None
+    ts = datetime.fromtimestamp(mtime, tz=timezone.utc) if mtime else datetime.now(timezone.utc)
+    return ts.strftime("%Y%m%dT%H%M%SZ")
+
+
 def _resolve_model_dir() -> tuple[Path, str, str | None]:
     """Returns (model_dir, deployed_at, source_model_id).
 
     source_model_id is the HuggingFace model ID from the optimizer report, or
     None when the path is supplied explicitly via MODEL_PATH.
     """
-    if model_path := os.environ.get("MODEL_PATH"):
-        p = Path(model_path)
-        onnx_file = next(p.glob("*.onnx"), None)
-        mtime = onnx_file.stat().st_mtime if onnx_file else None
-        ts = datetime.fromtimestamp(mtime, tz=timezone.utc) if mtime else datetime.now(timezone.utc)
-        return p, ts.strftime("%Y%m%dT%H%M%SZ"), None
+    if settings.model_path:
+        p = Path(settings.model_path)
+        return p, _deployed_at_from_dir(p), None
 
     log_root = _project_root() / "logs" / "optimizer"
     if not log_root.exists():
         raise RuntimeError("No MODEL_PATH set and logs/optimizer/ not found")
 
-    reports = sorted(
-        log_root.glob("*/report.json"),
-        key=lambda p: json.loads(p.read_text()).get("completed_at", ""),
-        reverse=True,
-    )
+    # Parse each report.json exactly once — sort the (report, path) pairs
+    # themselves rather than re-parsing the winner after sorting by a lambda
+    # key that already parsed every file once.
+    reports = [(json.loads(p.read_text()), p) for p in log_root.glob("*/report.json")]
+    reports.sort(key=lambda item: item[0].get("completed_at", ""), reverse=True)
     if not reports:
         raise RuntimeError("No completed optimization runs found in logs/optimizer/")
 
-    report = json.loads(reports[0].read_text())
+    report, _ = reports[0]
     model_dir = _project_root() / report["stages"]["quantize"]["output"]
     logger.info("Auto-selected model from run %s", report["run_id"])
 
@@ -69,16 +73,9 @@ class Classifier:
         if model_dir is not None:
             # Caller (lifespan) already resolved the directory — skip local discovery.
             model_dir = Path(model_dir)
-            onnx_file = next(model_dir.glob("*.onnx"), None)
-            mtime = onnx_file.stat().st_mtime if onnx_file else None
-            ts = (
-                datetime.fromtimestamp(mtime, tz=timezone.utc)
-                if mtime
-                else datetime.now(timezone.utc)
-            )
             resolved_dir, deployed_at, source_model_id = (
                 model_dir,
-                ts.strftime("%Y%m%dT%H%M%SZ"),
+                _deployed_at_from_dir(model_dir),
                 None,
             )
         else:
@@ -90,7 +87,7 @@ class Classifier:
             raise FileNotFoundError(f"No .onnx file in {model_dir}")
 
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = _INTRA_THREADS
+        opts.intra_op_num_threads = settings.ort_intra_threads
         opts.inter_op_num_threads = 1
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
@@ -104,9 +101,9 @@ class Classifier:
 
         config = json.loads((model_dir / "config.json").read_text())
         self.model_id = source_model_id or config.get("_name_or_path") or str(model_dir)
-        model_name = self.model_id.split("/")[-1]
-        self.model_version = f"{model_name}-{deployed_at}"
-        self.threshold = _THRESHOLD
+        quant_tag = model_dir.name  # "int8", "o2", or "fp32"
+        self.model_version = f"sentinel-roberta-{deployed_at}-{quant_tag}"
+        self.threshold = settings.classify_threshold
         self.model_path = str(model_dir)
 
         logger.info(
@@ -114,8 +111,8 @@ class Classifier:
             self.model_id,
             self.model_version,
             model_file.name,
-            _INTRA_THREADS,
-            _THRESHOLD,
+            settings.ort_intra_threads,
+            settings.classify_threshold,
         )
 
     def warmup(self) -> None:
@@ -126,15 +123,27 @@ class Classifier:
         inputs = self._tokenizer(
             texts,
             return_tensors="np",
-            padding=True,
+            # max_length (not dynamic padding) trades a bit of extra compute
+            # on short inputs for latency that doesn't depend on what else
+            # happens to be in the same batch — a batch containing one
+            # long input no longer inflates every other input's padding.
+            padding="max_length",
             truncation=True,
             max_length=512,
         )
         ort_inputs = {k: v for k, v in inputs.items() if k in self._input_names}
         logits = self._session.run(["logits"], ort_inputs)[0]
 
-        scores = _sigmoid(logits).squeeze(axis=-1)
-        labels = np.where(scores >= _THRESHOLD, "harm", "safe")
+        if logits.shape[-1] == 1:
+            # Single-logit binary head: sigmoid gives P(harm) directly.
+            scores = _sigmoid(logits).squeeze(axis=-1)
+        else:
+            # Multi-class softmax head: take P(last class) as the harm score.
+            # Assumes label ordering: 0 = safe, last = harm (standard HF convention).
+            exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            scores = (exp / exp.sum(axis=-1, keepdims=True))[:, -1]
+
+        labels = np.where(scores >= settings.classify_threshold, "harm", "safe")
 
         return [
             {"label": str(label), "score": round(float(score), 4)}

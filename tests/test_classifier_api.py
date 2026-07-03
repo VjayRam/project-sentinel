@@ -25,11 +25,17 @@ def client():
             yield c
 
 
-# ── /health ───────────────────────────────────────────────────────────────────
+# ── /health/live + /health/ready ─────────────────────────────────────────────
 
 
-def test_health_returns_ok(client):
-    r = client.get("/health")
+def test_liveness_always_ok(client):
+    r = client.get("/health/live")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+def test_readiness_ok_when_ready(client):
+    r = client.get("/health/ready")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
 

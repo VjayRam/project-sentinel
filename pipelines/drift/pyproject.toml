@@ -1,0 +1,12 @@
+[project]
+name = "sentinel-drift"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pyspark>=3.5,<4.0",
+    "psycopg[binary]>=3.2",
+]
+
+# NOT added to the root uv workspace — PySpark manages its own Python env.
+# Local dev:   cd pipelines/drift && uv run python drift_job.py
+# Cluster:     spark-submit --py-files metrics.py,db.py drift_job.py

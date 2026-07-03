@@ -36,8 +36,13 @@ MODEL_PATH=/path/to/int8 ./scripts/dev-start.sh
 | MinIO S3 API | `http://localhost:9000` | access: `sentinel` secret: `sentinel-minio` | Phase 3 ✓ |
 | PostgreSQL | `localhost:5432` | `sentinel` / `sentinel` / db `sentinel` | Phase 3 ✓ |
 | MongoDB | `localhost:27017` | `sentinel` / `sentinel` / db `sentinel` | Phase 3 ✓ |
+| mongo-express | `http://localhost:8081` | no login | Phase 3 ✓ |
 | Prometheus | `http://localhost:9090` | — | Phase 4 ✓ |
 | Grafana | `http://localhost:3000` | `admin` / `admin` | Phase 4 ✓ |
+| OTel Collector gRPC | `localhost:4317` | — | Phase 5 ✓ |
+| OTel Collector HTTP | `http://localhost:4318` | — | Phase 5 ✓ |
+| Kafka (EXTERNAL) | `localhost:9094` | — | Phase 5 ✓ |
+| Jaeger UI | `http://localhost:16686` | — | Phase 5 ✓ |
 
 ---
 
@@ -316,6 +321,21 @@ Document shape (when stream processor is wired in Phase 5):
 
 ---
 
+## mongo-express
+
+**URL:** `http://localhost:8081` (no login required — local dev only)
+
+Browser UI for inspecting MongoDB collections. Useful for verifying what the stream processor writes to `flagged_content`.
+
+### Manual port-forward
+```bash
+kubectl port-forward -n sentinel-data svc/mongo-express 8081:8081 &
+```
+
+`dev-start.sh` opens this automatically. Navigate to `http://localhost:8081` → select the `sentinel` database → open `flagged_content`.
+
+---
+
 ## Optimizer Pipeline
 
 Runs locally. Downloads a HuggingFace model, exports to ONNX, applies O2 + INT8 quantization, uploads all three stages to MinIO, uploads the report to MinIO, and registers in `model_registry` as `staging`.
@@ -326,7 +346,7 @@ Runs locally. Downloads a HuggingFace model, exports to ONNX, applies O2 + INT8 
 
 ### Run
 ```bash
-uv run --package sentinel-optimizer python -m pipelines.optimizer.pipeline \
+uv run --package sentinel-optimizer python -m pipelines.optimizer \
   --model-id VijayRam1812/content-classifier-roberta \
   --output-dir artifacts
 ```
@@ -409,14 +429,89 @@ kubectl port-forward -n sentinel-monitoring svc/grafana 3000:3000 &
 
 ---
 
+---
+
+## OTel Collector
+
+**gRPC:** `localhost:4317`  **HTTP:** `http://localhost:4318`
+
+Receives OTLP traces from any chat app or simulator, fans them out to:
+- Kafka topic `traces.raw` (3 partitions, encoding: `otlp_json`)
+- Jaeger (for trace visualisation)
+
+### Send a test trace
+```bash
+python scripts/simulate-traces.py --count 10 --harm-pct 0.3
+```
+
+### Manual port-forward
+```bash
+kubectl port-forward -n sentinel-monitoring svc/otel-collector 4317:4317 4318:4318 &
+```
+
+---
+
+## Jaeger
+
+**URL:** `http://localhost:16686`
+
+In-memory trace store (local dev only — traces do not survive pod restarts). Search by service name `chat-app-simulator` after running `simulate-traces.py`.
+
+### Manual port-forward
+```bash
+kubectl port-forward -n sentinel-monitoring svc/jaeger 16686:16686 &
+```
+
+---
+
+## Stream Processor
+
+Runs locally (started by `dev-start.sh`). Consumes `traces.raw`, calls `/classify/batch` on the classifier, writes results to PostgreSQL and MongoDB.
+
+**Logs:** `tail -f /tmp/sentinel-pf/stream-processor.log`
+
+### Data flow
+```
+Kafka traces.raw
+  → extract LLM spans (prompt + response)
+  → POST /classify/batch (persist=False)
+  → write to PostgreSQL classifications  (all)
+  → write to MongoDB flagged_content     (harm + 10% safe sample)
+  → commit Kafka offset
+```
+
+### Verify it's working
+```bash
+# After running simulate-traces.py:
+psql postgresql://sentinel:sentinel@localhost:5432/sentinel \
+  -c "SELECT label, count(*) FROM classifications GROUP BY label;"
+
+# Check MongoDB
+mongosh "mongodb://sentinel:sentinel@localhost:27017/sentinel" \
+  --eval "db.flagged_content.find().sort({ts:-1}).limit(5)"
+```
+
+### Key design decisions
+- **Manual offset commit** after successful PG + MongoDB writes — Kafka redelivers on failure
+- `persist=False` on `/classify/batch` prevents the classifier from double-writing to PG
+- `ON CONFLICT (span_id, text_type) WHERE span_id IS NOT NULL DO NOTHING` deduplicates replays
+- `SAFE_SAMPLE_RATE=0.1` (10%) prevents class imbalance in the MongoDB retraining dataset
+- `traces.raw` has 3 partitions — scaling stream processor beyond 3 replicas gives no benefit
+
+### classifications table (Phase 5 additions)
+Two new columns added by the Phase 5 schema migration (run on every `dev-start.sh`):
+
+| Column | Type | Notes |
+|---|---|---|
+| `span_id` | TEXT | OTLP span ID — nullable (classifier's own writes have no span_id) |
+| `text_type` | VARCHAR(8) | `"prompt"` or `"response"` |
+
+---
+
 ## What Is Not Yet Deployed (Upcoming Phases)
 
 | Component | Phase | What it enables |
 |---|---|---|
-| OTel Collector | 5 | Receives OTLP traces from the chat app on `:4317` |
-| Jaeger | 5 | Trace visualisation |
-| Kafka | 5 | Message bus: OTel traces → stream processor |
-| Stream processor | 5 | Consumes traces, calls `/classify`, writes to PostgreSQL + MongoDB |
 | Spark | 6 | Batch drift detection (PSI/JSD) |
 | Airflow | 7 | Orchestrates retrain + promote when PSI > 0.2 |
 | MLflow | 7 | Experiment tracking for retrain runs |

@@ -7,7 +7,7 @@ dependencies = [
 ]
 
 [tool.uv.workspace]
-members = ["services/*", "pipelines/optimizer"]
+members = ["services/*", "pipelines/optimizer", "pipelines/evaluation"]
 
 # CUDA 13.0 wheels — matches the RTX 4070 driver (CUDA Version: 13.0)
 [[tool.uv.index]]

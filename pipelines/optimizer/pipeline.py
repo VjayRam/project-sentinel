@@ -1,4 +1,3 @@
-import argparse
 import json
 import logging
 import time
@@ -6,10 +5,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import psycopg
+
 from pipelines.optimizer.export import export
 from pipelines.optimizer.optimize import optimize
 from pipelines.optimizer.quantize import quantize
-from pipelines.optimizer.registry import register_model
+from pipelines.optimizer.registry import DSN, register_model
 from pipelines.optimizer.upload import upload_report, upload_stage
 
 logging.basicConfig(
@@ -68,26 +69,28 @@ def run(model_id: str, output_dir: str, log_dir: str = "logs", opset: int = 17) 
         }
 
     # Determine model_path: MinIO key when available, local path as fallback.
+    # Built from the quantize stage's actual upload_stage() return value
+    # rather than re-deriving the bucket name — upload_stage already resolved
+    # MINIO_BUCKET, so hardcoding "models" here again risked the two silently
+    # diverging if MINIO_BUCKET was ever set to something else.
     if minio_ok:
-        model_path = f"models/{run_id}/int8/model_quantized.onnx"
-        logger.info("--- Stage: register | run_id=%s ---", run_id)
-        t0 = time.perf_counter()
-        register_model(run_id, model_path)
-        report["stages"]["register"] = {
-            "duration_s": round(time.perf_counter() - t0, 2),
-            "output": f"version={run_id} status=staging",
-        }
+        model_path = f"{report['stages']['quantize']['minio_path']}/model_quantized.onnx"
+        suffix = ""
     else:
-        # MinIO was unreachable for at least one stage — fall back to the local
-        # int8 path so the registry still records this run.
+        # MinIO was unreachable for at least one stage — fall back to the
+        # local int8 path so the registry still records this run.
         model_path = str(run_artifacts / "int8")
+        suffix = " (local fallback)"
         logger.warning("MinIO unavailable — registering local path as fallback: %s", model_path)
-        t0 = time.perf_counter()
-        register_model(run_id, model_path)
-        report["stages"]["register"] = {
-            "duration_s": round(time.perf_counter() - t0, 2),
-            "output": f"version={run_id} status=staging (local fallback)",
-        }
+
+    logger.info("--- Stage: register | run_id=%s ---", run_id)
+    t0 = time.perf_counter()
+    with psycopg.connect(DSN) as conn:
+        register_model(conn, run_id, model_path)
+    report["stages"]["register"] = {
+        "duration_s": round(time.perf_counter() - t0, 2),
+        "output": f"version={run_id} status=staging{suffix}",
+    }
 
     report["completed_at"] = datetime.now(timezone.utc).isoformat()
     report["model_path"] = model_path
@@ -103,12 +106,5 @@ def run(model_id: str, output_dir: str, log_dir: str = "logs", opset: int = 17) 
     return report_path
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ONNX optimization pipeline")
-    parser.add_argument("--model-id", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--log-dir", default="logs")
-    parser.add_argument("--opset", type=int, default=17)
-    args = parser.parse_args()
-
-    run(args.model_id, args.output_dir, args.log_dir, args.opset)
+# CLI entry point lives in pipelines/optimizer/__main__.py — run via
+# `python -m pipelines.optimizer` rather than `python -m pipelines.optimizer.pipeline`.

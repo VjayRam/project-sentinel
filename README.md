@@ -76,7 +76,7 @@ MinIO models/<run-id>/report.json — full pipeline report
 **Run the pipeline:**
 
 ```bash
-uv run --package sentinel-optimizer python -m pipelines.optimizer.pipeline \
+uv run --package sentinel-optimizer python -m pipelines.optimizer \
   --model-id VijayRam1812/content-classifier-roberta \
   --output-dir artifacts
 ```

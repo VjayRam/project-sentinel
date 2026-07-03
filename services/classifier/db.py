@@ -60,7 +60,7 @@ async def register_model(
     await pool.execute(
         """
         INSERT INTO model_registry (model_version, model_path, threshold, status)
-        VALUES ($1, $2, $3, 'active')
+        VALUES ($1, $2, $3, 'staging')
         ON CONFLICT (model_version) DO NOTHING
         """,
         model_version,
@@ -79,10 +79,21 @@ async def write_classification(
     latency_ms: float,
     inference_at: datetime,
 ) -> None:
+    """Write one classification row.
+
+    Same span_id/text_type columns + ON CONFLICT DO NOTHING conflict target
+    as services/stream-processor/writer.py's write_classifications — this
+    path has no span_id (direct API calls, not Kafka-sourced), so it's
+    always NULL here, which the partial unique index just doesn't apply to.
+    Keeping both write paths on the same conflict target means neither one
+    can silently diverge from what the schema actually enforces.
+    """
     await pool.execute(
         """
-        INSERT INTO classifications (input_text, label, score, model_version, latency_ms, inference_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO classifications
+            (input_text, label, score, model_version, latency_ms, inference_at, span_id, text_type)
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL)
+        ON CONFLICT (span_id, text_type) WHERE span_id IS NOT NULL DO NOTHING
         """,
         input_text,
         label,
@@ -100,12 +111,15 @@ async def write_classifications_batch(
     """Insert multiple classifications in a single round-trip.
 
     Each record is (input_text, label, score, model_version, latency_ms, inference_at).
-    executemany sends all rows in one network call.
+    executemany sends all rows in one network call. Same span_id/text_type +
+    ON CONFLICT shape as write_classification — see its docstring.
     """
     await pool.executemany(
         """
-        INSERT INTO classifications (input_text, label, score, model_version, latency_ms, inference_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO classifications
+            (input_text, label, score, model_version, latency_ms, inference_at, span_id, text_type)
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL)
+        ON CONFLICT (span_id, text_type) WHERE span_id IS NOT NULL DO NOTHING
         """,
         records,
     )
