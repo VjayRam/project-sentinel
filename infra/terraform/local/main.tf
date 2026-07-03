@@ -105,6 +105,18 @@ resource "kubernetes_config_map" "postgres_init" {
       CREATE INDEX IF NOT EXISTS drift_stats_model_version_idx
           ON drift_stats (model_version, computed_at DESC);
     SQL
+
+    # Airflow's own metadata store — a separate database on the same
+    # instance rather than a second PostgreSQL deployment (Phase 7 reuses
+    # existing infra where it can, per the project's "don't add
+    # infrastructure beyond what's needed" principle). CREATE DATABASE
+    # can't run inside the same transaction/file as CREATE TABLE reliably
+    # across all psql invocations, so it's a separate init file — this
+    # image's entrypoint runs *.sql files individually, one psql
+    # invocation per file, so a top-level CREATE DATABASE here is safe.
+    "02_airflow_db.sql" = <<-SQL
+      CREATE DATABASE airflow OWNER sentinel;
+    SQL
   }
 }
 
@@ -1108,7 +1120,7 @@ resource "kubernetes_stateful_set" "kafka" {
 
       spec {
         container {
-          name  = "kafka"
+          name = "kafka"
           # Pinned to match whatever :latest had already drifted to and
           # formatted the PVC's KRaft metadata with (verified: the cached
           # apache/kafka:latest image is kafka_2.13-4.3.1.jar). KRaft's
@@ -1267,7 +1279,7 @@ resource "kubernetes_job_v1" "kafka_topic_init" {
       spec {
         restart_policy = "OnFailure"
         container {
-          name  = "kafka-topic-init"
+          name = "kafka-topic-init"
           # Matches the broker's pinned version above — this only runs
           # kafka-topics.sh as a client, but keeping both pins identical
           # avoids a second version to track.
@@ -1286,7 +1298,7 @@ resource "kubernetes_job_v1" "kafka_topic_init" {
     backoff_limit = 10
   }
 
-  depends_on      = [kubernetes_stateful_set.kafka, kubernetes_service.kafka]
+  depends_on          = [kubernetes_stateful_set.kafka, kubernetes_service.kafka]
   wait_for_completion = true
   timeouts { create = "5m" }
 }

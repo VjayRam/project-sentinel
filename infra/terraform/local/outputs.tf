@@ -106,3 +106,8 @@ output "otel_collector_http_port_forward" {
   description = "Command to send OTLP HTTP traces to the collector from your local machine (:4318)"
   value       = "kubectl port-forward -n sentinel-monitoring svc/otel-collector 4318:4318"
 }
+
+output "airflow_webserver_port_forward" {
+  description = "Command to open the Airflow UI from your local machine (http://localhost:8080, admin/<airflow_admin_password>)"
+  value       = "kubectl port-forward -n sentinel-pipeline svc/airflow-webserver 8080:8080"
+}

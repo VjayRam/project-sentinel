@@ -74,3 +74,10 @@ variable "kafka_storage_size" {
   type        = string
   default     = "2Gi"
 }
+
+variable "airflow_admin_password" {
+  description = "Airflow webserver admin user password"
+  type        = string
+  sensitive   = true
+  default     = "sentinel"
+}
