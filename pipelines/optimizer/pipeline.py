@@ -68,8 +68,12 @@ def run(model_id: str, output_dir: str, log_dir: str = "logs", opset: int = 17) 
         }
 
     # Determine model_path: MinIO key when available, local path as fallback.
+    # Built from the quantize stage's actual upload_stage() return value
+    # rather than re-deriving the bucket name — upload_stage already resolved
+    # MINIO_BUCKET, so hardcoding "models" here again risked the two silently
+    # diverging if MINIO_BUCKET was ever set to something else.
     if minio_ok:
-        model_path = f"models/{run_id}/int8/model_quantized.onnx"
+        model_path = f"{report['stages']['quantize']['minio_path']}/model_quantized.onnx"
         logger.info("--- Stage: register | run_id=%s ---", run_id)
         t0 = time.perf_counter()
         register_model(run_id, model_path)

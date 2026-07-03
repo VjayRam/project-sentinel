@@ -40,6 +40,12 @@ DATABASE_URL = os.environ.get(
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://sentinel:sentinel@localhost:27017/sentinel")
 SAFE_SAMPLE_RATE = float(os.environ.get("SAFE_SAMPLE_RATE", "0.1"))
 MAX_POLL_RECORDS = int(os.environ.get("MAX_POLL_RECORDS", "50"))
+# Must not exceed the classifier's MAX_BATCH_SIZE (services/classifier/config.py's
+# settings.max_batch_size, env var MAX_BATCH_SIZE — same default) or
+# POST /v1/moderations 422s on oversized chunks. Not read from the same env
+# var name since this is a separately deployed service — set both explicitly
+# if either is tuned away from the shared default.
+CLASSIFY_CHUNK_SIZE = int(os.environ.get("CLASSIFY_CHUNK_SIZE", "64"))
 
 _running = True
 
@@ -67,7 +73,11 @@ def _pg_write(
     """Write to PostgreSQL and MongoDB, reconnecting once on connection failure.
 
     Returns the (possibly new) connection so the caller can update its reference.
-    Raises on failure so the caller knows not to commit the Kafka offset.
+    Raises on failure so the caller knows not to commit the Kafka offset — the
+    connection passed in (or opened during the retry) is guaranteed closed in
+    that case, so the caller never holds a reference to a leaked/half-open
+    connection: the next call always reconnects from scratch instead of
+    reusing something nobody closed.
     ON CONFLICT DO NOTHING on (span_id, text_type) makes the retry idempotent.
     """
     try:
@@ -80,10 +90,20 @@ def _pg_write(
             pg_conn.close()
         except Exception:
             pass
+
         pg_conn = _pg_connect()
-        write_classifications(pg_conn, spans, results, model_version, latency_ms)
-        write_flagged_content(mongo_db, spans, results, model_version, SAFE_SAMPLE_RATE)
-        return pg_conn
+        try:
+            write_classifications(pg_conn, spans, results, model_version, latency_ms)
+            write_flagged_content(mongo_db, spans, results, model_version, SAFE_SAMPLE_RATE)
+            return pg_conn
+        except Exception:
+            # Retry also failed (e.g. PG still down) — close this connection
+            # too instead of leaking it silently on every double-failure.
+            try:
+                pg_conn.close()
+            except Exception:
+                pass
+            raise
 
 
 def run() -> None:
@@ -132,10 +152,13 @@ def run() -> None:
 
             texts = [s["text"] for s in spans]
 
-            # Chunk texts to stay within MAX_BATCH_SIZE (64) per request.
-            # A single Kafka poll can accumulate many spans across multiple messages.
-            CHUNK = 64
-            chunks = [texts[i : i + CHUNK] for i in range(0, len(texts), CHUNK)]
+            # Chunk texts to stay within the classifier's MAX_BATCH_SIZE per
+            # request. A single Kafka poll can accumulate many spans across
+            # multiple messages.
+            chunks = [
+                texts[i : i + CLASSIFY_CHUNK_SIZE]
+                for i in range(0, len(texts), CLASSIFY_CHUNK_SIZE)
+            ]
 
             # persist=False: skip classifier's own PG write; we write here with span_id.
             all_results: list[dict] = []

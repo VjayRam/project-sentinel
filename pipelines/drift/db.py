@@ -54,24 +54,37 @@ def read_reference_scores(
     return scores
 
 
+#  Row cap for the current window — bounds how much data gets pulled into
+#  the driver process's memory (via psycopg here, then again via Spark's
+#  createDataFrame([...])) before Spark ever runs. Generous relative to a
+#  typical drift window: even at this cap, `scores` is a few MB of floats.
+MAX_CURRENT_ROWS = 100_000
+
+
 def read_current_scores(
     database_url: str,
     model_version: str,
     hours: int = 24,
+    max_rows: int = MAX_CURRENT_ROWS,
 ) -> tuple[list[float], datetime, datetime]:
-    """Return scores from the last `hours` for this model version.
+    """Return scores from the last `hours` for this model version, capped at
+    `max_rows` (the most recent rows in the window, not the oldest).
 
     Also returns (window_start, window_end) as UTC datetimes for drift_stats.
     """
     with _connect(database_url) as conn:
         rows = conn.execute(
             """
-            SELECT score, ts FROM classifications
-            WHERE model_version = %s
-              AND ts >= NOW() - make_interval(hours => %s)
+            SELECT score, ts FROM (
+                SELECT score, ts FROM classifications
+                WHERE model_version = %s
+                  AND ts >= NOW() - make_interval(hours => %s)
+                ORDER BY ts DESC
+                LIMIT %s
+            ) recent
             ORDER BY ts ASC
             """,
-            (model_version, hours),
+            (model_version, hours, max_rows),
         ).fetchall()
 
     if not rows:
@@ -81,6 +94,14 @@ def read_current_scores(
     window_start = rows[0][1]
     window_end = rows[-1][1]
 
+    if len(scores) == max_rows:
+        logger.warning(
+            "Current scores hit max_rows cap (%d) — window may include more "
+            "than %dh of data; drift stats reflect the most recent %d rows only",
+            max_rows,
+            hours,
+            max_rows,
+        )
     logger.info(
         "Current scores loaded | model=%s | n=%d | window=%s → %s",
         model_version,

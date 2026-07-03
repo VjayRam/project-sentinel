@@ -68,7 +68,7 @@ groups:
           service: classifier
         annotations:
           summary: "Classifier batches consistently near MAX_BATCH_SIZE"
-          description: "p90 batch size is {{ $value }}. Queue may be backing up — consider scaling replicas or raising MAX_BATCH_SIZE."
+          description: "p90 batch size is {{ $value }}. Queue may be backing up — consider scaling replicas or raising the MAX_BATCH_SIZE env var (config.py's settings.max_batch_size — also caps /classify/batch and /v1/moderations request size via schemas.py, so this one setting controls both)."
 
   - name: classifier.logs
     interval: 15s

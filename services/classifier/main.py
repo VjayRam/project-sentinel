@@ -71,6 +71,12 @@ async def lifespan(app: FastAPI):
                 logger.info("Registry empty — using local model discovery")
         except Exception:
             logger.exception("DB init failed — running without persistence")
+            if _pool is not None:
+                # init_pool succeeded (opens a connection eagerly, min_size=1)
+                # but a later call in this block failed — close it before
+                # dropping the reference, or that connection leaks for the
+                # lifetime of the pod.
+                await _pool.close()
             _pool = None
     else:
         logger.warning("DATABASE_URL not set — classifications will not be persisted")
@@ -84,7 +90,16 @@ async def lifespan(app: FastAPI):
 
     # ── 3. Record this model version in the registry (idempotent) ─────────────
     # ON CONFLICT DO NOTHING: first pod registers it, subsequent pods skip.
-    if _pool:
+    # Skip registration when model_path is an absolute local path (this pod
+    # fell back to local model discovery — MODEL_PATH env var or
+    # logs/optimizer/). That path only exists on THIS pod's filesystem;
+    # download.py treats any path starting with "/" as already-materialized
+    # and never fetches it from MinIO, so writing it to the shared registry
+    # would hand a different pod a path that doesn't exist on its own
+    # filesystem, crashing it on startup. Leaving the registry untouched
+    # here means other pods fall through to their own local discovery too,
+    # which is at least self-consistent per pod.
+    if _pool and not _classifier.model_path.startswith("/"):
         try:
             await _db.register_model(
                 _pool,
@@ -94,6 +109,12 @@ async def lifespan(app: FastAPI):
             )
         except Exception:
             logger.exception("Failed to register model version in registry")
+    elif _pool:
+        logger.info(
+            "Skipping registry write — model_path is a local filesystem path, "
+            "not portable across pods | path=%s",
+            _classifier.model_path,
+        )
 
     # ── 4. Signal readiness — pod now accepts traffic ─────────────────────────
     _ready = True

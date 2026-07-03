@@ -1,8 +1,14 @@
 from typing import Annotated
 
+from config import settings
 from pydantic import BaseModel, Field
 
-MAX_BATCH_SIZE = 64
+# Single source of truth for the request-size cap: config.py's settings
+# (env var MAX_BATCH_SIZE) — DynamicBatcher (batcher.py) reads the same
+# settings.max_batch_size, so raising/lowering the env var now moves both
+# the batcher's actual batching limit and this request-validation cap
+# together instead of them silently drifting apart.
+MAX_BATCH_SIZE = settings.max_batch_size
 
 
 # ── Internal classify API (kept for direct testing / backwards compat) ─────────
