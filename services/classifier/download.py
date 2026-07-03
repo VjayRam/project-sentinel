@@ -1,4 +1,5 @@
 import logging
+from functools import lru_cache
 from pathlib import Path
 
 import boto3
@@ -11,7 +12,15 @@ logger = logging.getLogger(__name__)
 _CACHE_ROOT = Path(settings.model_cache_dir)
 
 
+@lru_cache(maxsize=1)
 def _s3_client():
+    # Cached — a fresh boto3 client means a new TLS handshake + credential
+    # resolution on every call otherwise. Note: not literally shared with
+    # pipelines/optimizer/upload.py's near-identical factory — these are
+    # separately deployed packages (classifier vs optimizer, different
+    # Dockerfiles, no shared workspace member) so a real module-level
+    # extraction would mean adding a new shared dependency both must ship;
+    # kept in sync by convention (same Config args) instead.
     return boto3.client(
         "s3",
         endpoint_url=settings.minio_endpoint,

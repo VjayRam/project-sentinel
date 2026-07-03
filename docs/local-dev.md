@@ -346,7 +346,7 @@ Runs locally. Downloads a HuggingFace model, exports to ONNX, applies O2 + INT8 
 
 ### Run
 ```bash
-uv run --package sentinel-optimizer python -m pipelines.optimizer.pipeline \
+uv run --package sentinel-optimizer python -m pipelines.optimizer \
   --model-id VijayRam1812/content-classifier-roberta \
   --output-dir artifacts
 ```

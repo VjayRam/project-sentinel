@@ -1109,7 +1109,7 @@ resource "kubernetes_stateful_set" "kafka" {
       spec {
         container {
           name  = "kafka"
-          image = "apache/kafka:latest"
+          image = "apache/kafka:3.9.0"
 
           env {
             name  = "KAFKA_NODE_ID"
@@ -1259,7 +1259,7 @@ resource "kubernetes_job_v1" "kafka_topic_init" {
         restart_policy = "OnFailure"
         container {
           name  = "kafka-topic-init"
-          image = "apache/kafka:latest"
+          image = "apache/kafka:3.9.0"
           command = [
             "/bin/sh", "-c",
             "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic traces.raw --partitions 3 --replication-factor 1 && echo 'topic ready'"
@@ -1302,7 +1302,7 @@ resource "kubernetes_deployment" "jaeger" {
       spec {
         container {
           name  = "jaeger"
-          image = "jaegertracing/all-in-one:latest"
+          image = "jaegertracing/all-in-one:1.62.0"
 
           env {
             name  = "COLLECTOR_OTLP_ENABLED"

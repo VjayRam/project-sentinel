@@ -173,6 +173,36 @@ async def _persist_batch(records: list[tuple]) -> None:
         logger.exception("Failed to persist batch classifications")
 
 
+async def _classify_and_persist(
+    texts: list[str], endpoint: str, persist: bool
+) -> tuple[list[dict], float, datetime]:
+    """Shared by classify_batch() and moderate(): run inference off the event
+    loop, record per-endpoint metrics, and fire off persistence. Callers just
+    shape their own response from the (results, latency_ms, inference_at).
+    """
+    t0 = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(None, _classifier.predict, texts)
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    inference_at = datetime.now(timezone.utc)
+
+    BATCH_SIZE.observe(len(texts))
+    REQUEST_LATENCY.labels(endpoint=endpoint).observe(latency_ms / 1000)
+    for r in results:
+        REQUEST_COUNT.labels(endpoint=endpoint, label=r["label"]).inc()
+
+    if _pool and persist:
+        records = [
+            (text, r["label"], r["score"], _classifier.model_version, latency_ms, inference_at)
+            for text, r in zip(texts, results)
+        ]
+        task = asyncio.create_task(_persist_batch(records))
+        _persist_tasks.add(task)
+        task.add_done_callback(_persist_tasks.discard)
+
+    return results, latency_ms, inference_at
+
+
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify(request: ClassifyRequest) -> ClassifyResponse:
     t0 = time.perf_counter()
@@ -210,27 +240,9 @@ async def classify(request: ClassifyRequest) -> ClassifyResponse:
 
 @app.post("/classify/batch", response_model=BatchClassifyResponse)
 async def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse:
-    t0 = time.perf_counter()
-    loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(None, _classifier.predict, request.texts)
-    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-
-    inference_at = datetime.now(timezone.utc)
-
-    BATCH_SIZE.observe(len(request.texts))
-    REQUEST_LATENCY.labels(endpoint="classify_batch").observe(latency_ms / 1000)
-    for r in results:
-        REQUEST_COUNT.labels(endpoint="classify_batch", label=r["label"]).inc()
-
-    if _pool and request.persist:
-        records = [
-            (text, r["label"], r["score"], _classifier.model_version, latency_ms, inference_at)
-            for text, r in zip(request.texts, results)
-        ]
-        task = asyncio.create_task(_persist_batch(records))
-        _persist_tasks.add(task)
-        task.add_done_callback(_persist_tasks.discard)
-
+    results, latency_ms, inference_at = await _classify_and_persist(
+        request.texts, "classify_batch", request.persist
+    )
     return BatchClassifyResponse(
         results=[ClassifyResult(**r) for r in results],
         latency_ms=latency_ms,
@@ -248,26 +260,12 @@ async def moderate(request: ModerationRequest) -> ModerationResponse:
     per input in the same order. Drop-in compatible with openai.moderations.create().
     """
     texts = [request.input] if isinstance(request.input, str) else list(request.input)
-
-    t0 = time.perf_counter()
-    loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(None, _classifier.predict, texts)
-    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-    inference_at = datetime.now(timezone.utc)
-
-    BATCH_SIZE.observe(len(texts))
-    REQUEST_LATENCY.labels(endpoint="moderations").observe(latency_ms / 1000)
-    for r in results:
-        REQUEST_COUNT.labels(endpoint="moderations", label=r["label"]).inc()
-
-    if _pool and request.persist:
-        records = [
-            (text, r["label"], r["score"], _classifier.model_version, latency_ms, inference_at)
-            for text, r in zip(texts, results)
-        ]
-        task = asyncio.create_task(_persist_batch(records))
-        _persist_tasks.add(task)
-        task.add_done_callback(_persist_tasks.discard)
+    # Always persists — this is the public OpenAI-compatible surface, so it
+    # doesn't carry a Sentinel-internal skip-persistence knob (see schemas.py:
+    # ModerationRequest used to have a `persist` field for exactly that; the
+    # stream processor now calls /classify/batch instead, which still has one
+    # since that endpoint is explicitly internal/testing-only).
+    results, _, _ = await _classify_and_persist(texts, "moderations", persist=True)
 
     return ModerationResponse(
         id=f"modr-{uuid.uuid4().hex[:12]}",

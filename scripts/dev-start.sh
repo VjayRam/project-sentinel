@@ -138,7 +138,7 @@ info "Syncing PostgreSQL password from secret..."
 PG_PASSWORD=$(kubectl get secret postgresql-credentials -n sentinel-data \
     -o jsonpath='{.data.password}' | base64 -d)
 if kubectl exec -n sentinel-data postgresql-0 -- \
-    psql -U sentinel -d sentinel -c "ALTER USER sentinel PASSWORD '${PG_PASSWORD}';"; then
+    psql -U sentinel -d sentinel -v pw="$PG_PASSWORD" -c "ALTER USER sentinel PASSWORD :'pw';"; then
     info "PostgreSQL password synced"
 else
     warn "ALTER USER failed — local socket auth may not be trusted in this setup."
@@ -189,14 +189,14 @@ kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/otel-collector
 kubectl port-forward --address=0.0.0.0 -n sentinel-app svc/classifier 8000:8000 \
     &>"$PF_DIR/classifier.log" & echo $! >"$PF_DIR/classifier.pid"
 
-wait_for_port "PostgreSQL"     5432  postgres
-wait_for_port "MongoDB"        27017 mongo
-wait_for_port "MinIO"          9000  minio
-wait_for_port "mongo-express"  8081  mongo-express
-wait_for_port "Prometheus"     9090  prometheus
-wait_for_port "Grafana"        3000  grafana
-wait_for_port "Jaeger"         16686 jaeger
-wait_for_port "OTel Collector" 4317  otel-collector
+wait_for_port "PostgreSQL"     5432  postgres || true
+wait_for_port "MongoDB"        27017 mongo || true
+wait_for_port "MinIO"          9000  minio || true
+wait_for_port "mongo-express"  8081  mongo-express || true
+wait_for_port "Prometheus"     9090  prometheus || true
+wait_for_port "Grafana"        3000  grafana || true
+wait_for_port "Jaeger"         16686 jaeger || true
+wait_for_port "OTel Collector" 4317  otel-collector || true
 
 # ── schema ─────────────────────────────────────────────────────────────────────
 # Schema (model_registry, classifications, drift_stats, and all indexes) is
@@ -236,11 +236,11 @@ if [[ -z "${MODEL_PATH:-}" ]] && command -v psql >/dev/null 2>&1; then
 
         if [[ -n "$_minio_path" ]]; then
             info "Active registry entry is a host path — switching to MinIO path: $_minio_path"
-            psql "$DATABASE_URL" -c "
+            psql "$DATABASE_URL" -v path="$_minio_path" -c "
                 UPDATE model_registry SET status = 'retired'
                 WHERE model_path NOT LIKE 'models/%' AND status IN ('active','staging');
                 UPDATE model_registry SET status = 'active', promoted_at = NOW()
-                WHERE model_path = '$_minio_path';" >/dev/null 2>&1 || true
+                WHERE model_path = :'path';" >/dev/null 2>&1 || true
         elif ! find "$_registry_path" -maxdepth 1 -name "*.onnx" 2>/dev/null | grep -q .; then
             warn "Registry has a stale local path (artifacts deleted): $_registry_path"
             psql "$DATABASE_URL" -c \
@@ -251,7 +251,7 @@ if [[ -z "${MODEL_PATH:-}" ]] && command -v psql >/dev/null 2>&1; then
             _needs_optimizer=true
         else
             warn "Active model is a local host path — pods cannot access it."
-            warn "Run the optimizer to upload the model to MinIO: uv run --package sentinel-optimizer python -m pipelines.optimizer.pipeline ..."
+            warn "Run the optimizer to upload the model to MinIO: uv run --package sentinel-optimizer python -m pipelines.optimizer ..."
             _needs_optimizer=true
         fi
     fi
@@ -268,7 +268,7 @@ if [[ -z "${MODEL_PATH:-}" ]] && command -v psql >/dev/null 2>&1; then
         info "Running optimizer pipeline to bootstrap the first model..."
         info "(downloads ~500 MB on first run — this takes a few minutes)"
         cd "$REPO_ROOT"
-        uv run --package sentinel-optimizer python -m pipelines.optimizer.pipeline \
+        uv run --package sentinel-optimizer python -m pipelines.optimizer \
             --model-id VijayRam1812/content-classifier-roberta \
             --output-dir artifacts \
             --log-dir logs \
@@ -295,7 +295,7 @@ kubectl rollout status deployment/stream-processor -n sentinel-app --timeout=120
 kill "$(cat "$PF_DIR/classifier.pid")" 2>/dev/null || true
 kubectl port-forward --address=0.0.0.0 -n sentinel-app svc/classifier 8000:8000 \
     &>"$PF_DIR/classifier.log" & echo $! >"$PF_DIR/classifier.pid"
-wait_for_port "Classifier" 8000 classifier
+wait_for_port "Classifier" 8000 classifier || true
 
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"

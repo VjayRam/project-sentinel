@@ -1,5 +1,7 @@
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
 import boto3
@@ -11,7 +13,12 @@ logger = logging.getLogger(__name__)
 _BUCKET = os.getenv("MINIO_BUCKET", "models")
 
 
+@lru_cache(maxsize=1)
 def _s3_client():
+    # Cached — a fresh boto3 client means a new TLS handshake + credential
+    # resolution on every call otherwise. Not literally shared with
+    # services/classifier/download.py's near-identical factory — separately
+    # deployed packages, see that file's comment for why.
     return boto3.client(
         "s3",
         endpoint_url=os.getenv("MINIO_ENDPOINT", "http://localhost:9000"),
@@ -22,7 +29,7 @@ def _s3_client():
             # Short timeout so a missing MinIO fails fast instead of hanging
             # the pipeline for the default 60 seconds.
             connect_timeout=5,
-            retries={"max_attempts": 1},
+            retries={"max_attempts": 2},
         ),
         region_name="us-east-1",
     )
@@ -65,10 +72,19 @@ def upload_stage(run_id: str, stage: str, stage_dir: Path) -> str | None:
 
     try:
         s3 = _s3_client()
-        for file in files:
+
+        def _upload_one(file: Path) -> None:
             key = f"{run_id}/{stage}/{file.name}"
             logger.info("Uploading %s → s3://%s/%s", file.name, _BUCKET, key)
             s3.upload_file(str(file), _BUCKET, key)
+
+        # boto3 clients are thread-safe for concurrent calls. Parallelizing
+        # matters most for the fp32 stage (full model + tokenizer files);
+        # list(...) forces the map to completion and re-raises the first
+        # exception, so a failed upload still hits the except block below
+        # exactly like the old sequential loop did.
+        with ThreadPoolExecutor(max_workers=min(8, len(files))) as pool:
+            list(pool.map(_upload_one, files))
 
         prefix = f"{_BUCKET}/{run_id}/{stage}"
         logger.info("Stage '%s' uploaded | files=%d | prefix=%s", stage, len(files), prefix)

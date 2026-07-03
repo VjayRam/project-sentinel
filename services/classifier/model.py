@@ -23,6 +23,16 @@ def _project_root() -> Path:
     return here
 
 
+def _deployed_at_from_dir(model_dir: Path) -> str:
+    """Derive a deployed_at timestamp string from a model directory's .onnx
+    file mtime, falling back to now() if no .onnx file is present yet.
+    """
+    onnx_file = next(model_dir.glob("*.onnx"), None)
+    mtime = onnx_file.stat().st_mtime if onnx_file else None
+    ts = datetime.fromtimestamp(mtime, tz=timezone.utc) if mtime else datetime.now(timezone.utc)
+    return ts.strftime("%Y%m%dT%H%M%SZ")
+
+
 def _resolve_model_dir() -> tuple[Path, str, str | None]:
     """Returns (model_dir, deployed_at, source_model_id).
 
@@ -31,24 +41,23 @@ def _resolve_model_dir() -> tuple[Path, str, str | None]:
     """
     if settings.model_path:
         p = Path(settings.model_path)
-        onnx_file = next(p.glob("*.onnx"), None)
-        mtime = onnx_file.stat().st_mtime if onnx_file else None
-        ts = datetime.fromtimestamp(mtime, tz=timezone.utc) if mtime else datetime.now(timezone.utc)
-        return p, ts.strftime("%Y%m%dT%H%M%SZ"), None
+        return p, _deployed_at_from_dir(p), None
 
     log_root = _project_root() / "logs" / "optimizer"
     if not log_root.exists():
         raise RuntimeError("No MODEL_PATH set and logs/optimizer/ not found")
 
-    reports = sorted(
-        log_root.glob("*/report.json"),
-        key=lambda p: json.loads(p.read_text()).get("completed_at", ""),
-        reverse=True,
-    )
+    # Parse each report.json exactly once — sort the (report, path) pairs
+    # themselves rather than re-parsing the winner after sorting by a lambda
+    # key that already parsed every file once.
+    reports = [
+        (json.loads(p.read_text()), p) for p in log_root.glob("*/report.json")
+    ]
+    reports.sort(key=lambda item: item[0].get("completed_at", ""), reverse=True)
     if not reports:
         raise RuntimeError("No completed optimization runs found in logs/optimizer/")
 
-    report = json.loads(reports[0].read_text())
+    report, _ = reports[0]
     model_dir = _project_root() / report["stages"]["quantize"]["output"]
     logger.info("Auto-selected model from run %s", report["run_id"])
 
@@ -66,16 +75,9 @@ class Classifier:
         if model_dir is not None:
             # Caller (lifespan) already resolved the directory — skip local discovery.
             model_dir = Path(model_dir)
-            onnx_file = next(model_dir.glob("*.onnx"), None)
-            mtime = onnx_file.stat().st_mtime if onnx_file else None
-            ts = (
-                datetime.fromtimestamp(mtime, tz=timezone.utc)
-                if mtime
-                else datetime.now(timezone.utc)
-            )
             resolved_dir, deployed_at, source_model_id = (
                 model_dir,
-                ts.strftime("%Y%m%dT%H%M%SZ"),
+                _deployed_at_from_dir(model_dir),
                 None,
             )
         else:
@@ -123,7 +125,11 @@ class Classifier:
         inputs = self._tokenizer(
             texts,
             return_tensors="np",
-            padding=True,
+            # max_length (not dynamic padding) trades a bit of extra compute
+            # on short inputs for latency that doesn't depend on what else
+            # happens to be in the same batch — a batch containing one
+            # long input no longer inflates every other input's padding.
+            padding="max_length",
             truncation=True,
             max_length=512,
         )

@@ -32,13 +32,21 @@ def _bin_scores(df: DataFrame, n_bins: int) -> DataFrame:
     """Add a 'bin' column: integer 0 to n_bins-1 based on score.
 
     floor(score * n_bins) gives 0–n_bins, so scores of exactly 1.0 land in
-    bin n_bins — clamped to n_bins-1 with least().
+    bin n_bins — clamped to n_bins-1 with least(). Symmetric clamp on the
+    low end with greatest(..., 0): scores are expected in [0, 1], but
+    nothing enforces that upstream (no DB CHECK constraint), so a
+    floating-point rounding artifact or a future differently-calibrated
+    model producing a small negative value folds into bin 0 instead of
+    silently vanishing from the left join in compute_drift() below.
     """
     return df.withColumn(
         "bin",
-        F.least(
-            F.floor(F.col("score") * n_bins).cast("int"),
-            F.lit(n_bins - 1),
+        F.greatest(
+            F.least(
+                F.floor(F.col("score") * n_bins).cast("int"),
+                F.lit(n_bins - 1),
+            ),
+            F.lit(0),
         ),
     )
 

@@ -62,9 +62,6 @@ class ModerationResult(BaseModel):
 
 class ModerationRequest(BaseModel):
     input: str | Annotated[list[str], Field(min_length=1, max_length=MAX_BATCH_SIZE)]
-    # Sentinel extension: set False to skip classifier-side PG write.
-    # Not in the OpenAI spec — used internally by the stream processor.
-    persist: bool = True
 
 
 class ModerationResponse(BaseModel):

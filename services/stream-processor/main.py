@@ -161,13 +161,17 @@ def run() -> None:
             ]
 
             # persist=False: skip classifier's own PG write; we write here with span_id.
+            # Uses /classify/batch (not /v1/moderations) — it returns
+            # {label, score} directly instead of the OpenAI-compatible
+            # flagged/category_scores.harm shape, so there's no response
+            # remapping tying this consumer to that wire format.
             all_results: list[dict] = []
             classify_ms_total = 0.0
             model_version = ""
             try:
                 for chunk in chunks:
                     t0 = time.perf_counter()
-                    resp = http.post("/v1/moderations", json={"input": chunk, "persist": False})
+                    resp = http.post("/classify/batch", json={"texts": chunk, "persist": False})
                     if not resp.is_success:
                         logger.error(
                             "Classify HTTP %d — body: %s | chunk=%d texts",
@@ -178,14 +182,8 @@ def run() -> None:
                     resp.raise_for_status()
                     classify_ms_total += (time.perf_counter() - t0) * 1000
                     body = resp.json()
-                    model_version = body["model"]
-                    all_results.extend(
-                        {
-                            "label": "harm" if r["flagged"] else "safe",
-                            "score": r["category_scores"]["harm"],
-                        }
-                        for r in body["results"]
-                    )
+                    model_version = body["model_version"]
+                    all_results.extend(body["results"])
             except Exception:
                 logger.exception("Classify failed — not committing, Kafka will redeliver")
                 continue

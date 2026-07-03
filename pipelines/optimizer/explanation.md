@@ -225,7 +225,7 @@ Records per-stage duration and output path for every run. This file is the contr
 Makes the script both runnable directly and importable. Airflow can call `run()` as a Python function without spawning a subprocess. Running directly:
 
 ```bash
-uv run python -m pipelines.optimizer.pipeline \
+uv run python -m pipelines.optimizer \
   --model-id VijayRam1812/content-classifier-roberta \
   --output-dir models/
 ```
