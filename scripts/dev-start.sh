@@ -137,8 +137,13 @@ kubectl exec -n sentinel-data kafka-0 -- \
 info "Syncing PostgreSQL password from secret..."
 PG_PASSWORD=$(kubectl get secret postgresql-credentials -n sentinel-data \
     -o jsonpath='{.data.password}' | base64 -d)
-if kubectl exec -n sentinel-data postgresql-0 -- \
-    psql -U sentinel -d sentinel -v pw="$PG_PASSWORD" -c "ALTER USER sentinel PASSWORD :'pw';"; then
+# -v/:'var' substitution only happens when psql reads SQL as a script
+# (stdin/-f) — NOT via -c, which bypasses that parser and sends the string
+# through unexpanded (verified live: -c left the literal text ":'pw'" in
+# the query, which Postgres then rejected as a syntax error). Piped via
+# stdin instead (kubectl exec -i to keep stdin open across the exec).
+if echo "ALTER USER sentinel PASSWORD :'pw';" | kubectl exec -i -n sentinel-data postgresql-0 -- \
+    psql -U sentinel -d sentinel -v pw="$PG_PASSWORD"; then
     info "PostgreSQL password synced"
 else
     warn "ALTER USER failed — local socket auth may not be trusted in this setup."
@@ -236,11 +241,17 @@ if [[ -z "${MODEL_PATH:-}" ]] && command -v psql >/dev/null 2>&1; then
 
         if [[ -n "$_minio_path" ]]; then
             info "Active registry entry is a host path — switching to MinIO path: $_minio_path"
-            psql "$DATABASE_URL" -v path="$_minio_path" -c "
+            # -v/:'var' substitution only happens when psql reads SQL as a
+            # script (stdin/-f) — NOT via -c, which bypasses that parser and
+            # sends the string through unexpanded (verified live: -c left
+            # the literal text ":'path'" in the query, which Postgres then
+            # rejected as a syntax error). Piped via stdin instead.
+            echo "
                 UPDATE model_registry SET status = 'retired'
                 WHERE model_path NOT LIKE 'models/%' AND status IN ('active','staging');
                 UPDATE model_registry SET status = 'active', promoted_at = NOW()
-                WHERE model_path = :'path';" >/dev/null 2>&1 || true
+                WHERE model_path = :'path';" \
+                | psql "$DATABASE_URL" -v path="$_minio_path" >/dev/null 2>&1 || true
         elif ! find "$_registry_path" -maxdepth 1 -name "*.onnx" 2>/dev/null | grep -q .; then
             warn "Registry has a stale local path (artifacts deleted): $_registry_path"
             psql "$DATABASE_URL" -c \
