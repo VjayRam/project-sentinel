@@ -4,12 +4,13 @@
 # What this does:
 #   1. Ensures the k3d cluster is running (creates it if needed)
 #   2. Builds classifier + stream-processor Docker images and imports into k3d
-#   3. Runs terraform apply (all infra + app deployments)
-#   4. Waits for data-layer pods to pass readiness probes
-#   5. Opens port-forwards for every service
-#   6. Runs schema migration and model auto-bootstrap
-#   7. Restarts app deployments so they pick up the bootstrapped model
-#   8. Waits for classifier + stream-processor pods to become ready
+#   3. Runs terraform apply (all infra + app deployments, incl. Airflow)
+#   4. Waits for data-layer pods (+ Airflow scheduler/webserver) to pass readiness probes
+#   5. Verifies Kafka topic exists and Airflow's DAGs load with no import errors
+#   6. Opens port-forwards for every service
+#   7. Runs schema migration and model auto-bootstrap
+#   8. Restarts app deployments so they pick up the bootstrapped model
+#   9. Waits for classifier + stream-processor pods to become ready
 #
 # Ctrl-C stops everything cleanly.
 #
@@ -118,6 +119,8 @@ kubectl wait --for=condition=ready pod -l app=prometheus    -n sentinel-monitori
 kubectl wait --for=condition=ready pod -l app=grafana       -n sentinel-monitoring --timeout=120s
 kubectl wait --for=condition=ready pod -l app=jaeger        -n sentinel-monitoring --timeout=60s
 kubectl wait --for=condition=ready pod -l app=otel-collector -n sentinel-monitoring --timeout=60s
+kubectl wait --for=condition=ready pod -l release=airflow,component=scheduler -n sentinel-pipeline --timeout=180s
+kubectl wait --for=condition=ready pod -l release=airflow,component=webserver -n sentinel-pipeline --timeout=180s
 info "Data-layer pods ready"
 
 # ── ensure Kafka topic exists ─────────────────────────────────────────────────
@@ -132,6 +135,31 @@ kubectl exec -n sentinel-data kafka-0 -- \
     --partitions 3 \
     --replication-factor 1 >/dev/null 2>&1 && info "Kafka topic ready" \
     || warn "Could not ensure Kafka topic — check kafka-0 pod"
+
+# ── verify Airflow can actually load and run a DAG ────────────────────────────
+# healthcheck_dag.py (mounted from orchestration/ via ConfigMap) is a minimal
+# smoke test: if it fails to parse or import here, retrain_dag.py (Phase 7.3)
+# won't fare any better. Checks import errors rather than triggering a new
+# run every dev-start.sh invocation, which would clutter run history for no
+# benefit — the DAG's own logic is trivial enough that "it parses" is already
+# a meaningful signal.
+info "Verifying Airflow DAGs load correctly..."
+_airflow_dag_ok=false
+for _ in $(seq 1 20); do
+    _import_errors=$(kubectl exec -n sentinel-pipeline airflow-scheduler-0 -c scheduler -- \
+        airflow dags list-import-errors 2>/dev/null || true)
+    if echo "$_import_errors" | grep -q "No data found"; then
+        _airflow_dag_ok=true
+        break
+    fi
+    sleep 3
+done
+if [[ "$_airflow_dag_ok" == true ]]; then
+    info "Airflow DAGs loaded with no import errors"
+else
+    warn "Airflow DAG import errors detected (or scheduler not ready in time):"
+    warn "$_import_errors"
+fi
 
 # ── sync PostgreSQL password ───────────────────────────────────────────────────
 info "Syncing PostgreSQL password from secret..."
@@ -190,6 +218,9 @@ kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/jaeger 16686:1
 kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/otel-collector 4317:4317 4318:4318 \
     &>"$PF_DIR/otel-collector.log" & echo $! >"$PF_DIR/otel-collector.pid"
 
+kubectl port-forward --address=0.0.0.0 -n sentinel-pipeline svc/airflow-webserver 8080:8080 \
+    &>"$PF_DIR/airflow.log" & echo $! >"$PF_DIR/airflow.pid"
+
 # Classifier port-forward — allows local curl/tests against the in-cluster pod.
 kubectl port-forward --address=0.0.0.0 -n sentinel-app svc/classifier 8000:8000 \
     &>"$PF_DIR/classifier.log" & echo $! >"$PF_DIR/classifier.pid"
@@ -202,6 +233,7 @@ wait_for_port "Prometheus"     9090  prometheus || true
 wait_for_port "Grafana"        3000  grafana || true
 wait_for_port "Jaeger"         16686 jaeger || true
 wait_for_port "OTel Collector" 4317  otel-collector || true
+wait_for_port "Airflow"        8080  airflow || true
 
 # ── schema ─────────────────────────────────────────────────────────────────────
 # Schema (model_registry, classifications, drift_stats, and all indexes) is
@@ -325,6 +357,8 @@ echo "  MinIO S3 API     →  http://localhost:9000"
 echo "  mongo-express    →  http://localhost:8081"
 echo ""
 echo "  OTel Collector   →  grpc://localhost:4317  http://localhost:4318"
+echo ""
+echo "  Airflow UI       →  http://localhost:8080  (admin / sentinel)"
 echo ""
 echo "  PostgreSQL       →  localhost:5432  (sentinel / sentinel)"
 echo "  MongoDB          →  localhost:27017 (sentinel / sentinel)"
