@@ -1109,7 +1109,16 @@ resource "kubernetes_stateful_set" "kafka" {
       spec {
         container {
           name  = "kafka"
-          image = "apache/kafka:3.9.0"
+          # Pinned to match whatever :latest had already drifted to and
+          # formatted the PVC's KRaft metadata with (verified: the cached
+          # apache/kafka:latest image is kafka_2.13-4.3.1.jar). KRaft's
+          # on-disk metadata format is forward-compatible only — pinning to
+          # an OLDER version than what already formatted the volume crashes
+          # every broker start with "No MetadataVersion with feature level
+          # N". If this version is ever bumped, wipe the PVC first
+          # (kubectl delete pvc data-kafka-0 -n sentinel-data) or pin to a
+          # version >= whatever last wrote to it.
+          image = "apache/kafka:4.3.1"
 
           env {
             name  = "KAFKA_NODE_ID"
@@ -1259,7 +1268,10 @@ resource "kubernetes_job_v1" "kafka_topic_init" {
         restart_policy = "OnFailure"
         container {
           name  = "kafka-topic-init"
-          image = "apache/kafka:3.9.0"
+          # Matches the broker's pinned version above — this only runs
+          # kafka-topics.sh as a client, but keeping both pins identical
+          # avoids a second version to track.
+          image = "apache/kafka:4.3.1"
           command = [
             "/bin/sh", "-c",
             "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic traces.raw --partitions 3 --replication-factor 1 && echo 'topic ready'"
