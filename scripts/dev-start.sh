@@ -218,7 +218,12 @@ kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/jaeger 16686:1
 kubectl port-forward --address=0.0.0.0 -n sentinel-monitoring svc/otel-collector 4317:4317 4318:4318 \
     &>"$PF_DIR/otel-collector.log" & echo $! >"$PF_DIR/otel-collector.pid"
 
-kubectl port-forward --address=0.0.0.0 -n sentinel-pipeline svc/airflow-webserver 8080:8080 \
+# Local port 8090, not 8080 — k3d's own serverlb container publishes host
+# port 8080 -> its internal ingress (0.0.0.0:8080->80/tcp) by default,
+# unrelated to anything in this repo. Binding 8080 here silently loses the
+# race against it (or fails outright), so the webserver's remote port
+# (8080, inside the pod/Service) stays the same; only the local side moves.
+kubectl port-forward --address=0.0.0.0 -n sentinel-pipeline svc/airflow-webserver 8090:8080 \
     &>"$PF_DIR/airflow.log" & echo $! >"$PF_DIR/airflow.pid"
 
 # Classifier port-forward — allows local curl/tests against the in-cluster pod.
@@ -233,7 +238,7 @@ wait_for_port "Prometheus"     9090  prometheus || true
 wait_for_port "Grafana"        3000  grafana || true
 wait_for_port "Jaeger"         16686 jaeger || true
 wait_for_port "OTel Collector" 4317  otel-collector || true
-wait_for_port "Airflow"        8080  airflow || true
+wait_for_port "Airflow"        8090  airflow || true
 
 # ── schema ─────────────────────────────────────────────────────────────────────
 # Schema (model_registry, classifications, drift_stats, and all indexes) is
@@ -358,7 +363,7 @@ echo "  mongo-express    →  http://localhost:8081"
 echo ""
 echo "  OTel Collector   →  grpc://localhost:4317  http://localhost:4318"
 echo ""
-echo "  Airflow UI       →  http://localhost:8080  (admin / sentinel)"
+echo "  Airflow UI       →  http://localhost:8090  (admin / sentinel)"
 echo ""
 echo "  PostgreSQL       →  localhost:5432  (sentinel / sentinel)"
 echo "  MongoDB          →  localhost:27017 (sentinel / sentinel)"

@@ -108,6 +108,6 @@ output "otel_collector_http_port_forward" {
 }
 
 output "airflow_webserver_port_forward" {
-  description = "Command to open the Airflow UI from your local machine (http://localhost:8080, admin/<airflow_admin_password>)"
-  value       = "kubectl port-forward -n sentinel-pipeline svc/airflow-webserver 8080:8080"
+  description = "Command to open the Airflow UI from your local machine (http://localhost:8090, admin/<airflow_admin_password>). Local port 8090, not 8080 — k3d's serverlb container already publishes host port 8080 for its own ingress."
+  value       = "kubectl port-forward -n sentinel-pipeline svc/airflow-webserver 8090:8080"
 }
