@@ -94,6 +94,19 @@ def _pg_write(
     that case, so the caller never holds a reference to a leaked/half-open
     connection: the next call always reconnects from scratch instead of
     reusing something nobody closed.
+
+    Two distinct PG failure modes need different recovery:
+    - OperationalError (connection actually lost): close + reconnect + retry once.
+    - Any other psycopg.Error (e.g. a constraint violation): the connection
+      is still alive, but the current transaction is aborted — every command
+      on it then fails with InFailedSqlTransaction until rolled back.
+      Reproduced live: a stale model_version (classifier registered a model
+      version the DB didn't have yet — see main.py's #43 fix) triggered a
+      ForeignKeyViolation on classifications, and without this rollback the
+      long-lived connection stayed permanently broken — every subsequent
+      batch failed the same way forever, not just the one that hit the FK
+      violation.
+
     ON CONFLICT DO NOTHING on (span_id, text_type) makes the retry idempotent.
     """
     try:
@@ -120,6 +133,16 @@ def _pg_write(
             except Exception:
                 pass
             raise
+    except psycopg.Error:
+        # Connection is alive but its transaction is aborted (e.g. a
+        # constraint violation) — roll back so it's usable again on the
+        # NEXT call instead of failing every subsequent batch forever.
+        logger.exception("PostgreSQL write failed — rolling back to keep the connection usable")
+        try:
+            pg_conn.rollback()
+        except Exception:
+            logger.exception("Rollback itself failed — connection may still be unusable")
+        raise
 
 
 def run() -> None:
