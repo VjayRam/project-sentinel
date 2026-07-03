@@ -7,7 +7,10 @@ pipelines/optimizer/
   export.py       — Stage 1: HuggingFace Hub → ONNX FP32
   optimize.py     — Stage 2: ONNX FP32 → ONNX O2 (graph optimization)
   quantize.py     — Stage 3: ONNX O2 → ONNX INT8 (dynamic quantization)
-  pipeline.py     — Orchestrator: runs all 3 stages, writes report.json
+  upload.py       — MinIO upload for each stage's artifacts + the final report
+  registry.py     — model_registry INSERT (status='staging')
+  pipeline.py     — Orchestrator: runs all 3 stages, uploads, registers, writes report.json
+  __main__.py     — CLI entry point (`python -m pipelines.optimizer`)
 ```
 
 Each stage is a separate file because each produces a checkpoint artifact on disk. If quantization fails with a bad config, you re-run from Stage 3 without re-downloading and re-exporting the model. In Airflow (Phase 7), each stage becomes a separate task so the DAG can retry exactly the step that failed.
@@ -138,6 +141,113 @@ O2 produces no size reduction (same math, different graph structure). INT8 gives
 
 ---
 
+## upload.py
+
+### Every stage uploads to MinIO immediately after it completes
+
+`pipeline.py`'s stage loop calls `upload_stage(run_id, dir_name, ...)` right
+after each of `export`/`optimize`/`quantize` finishes, not once at the end —
+so `models/<run-id>/fp32/`, `.../o2/`, `.../int8/` land in MinIO as the
+pipeline progresses, mirroring the local `models/<run-id>/` tree exactly. If
+the pipeline crashes partway through (e.g. quantization OOMs), whatever
+stages already completed are still durably in MinIO, not lost with the pod.
+
+### `_s3_client()` is `@lru_cache`d
+
+```python
+@lru_cache(maxsize=1)
+def _s3_client():
+    return boto3.client("s3", ...)
+```
+
+A fresh `boto3.client("s3", ...)` per call means a new TLS handshake and
+credential resolution every time — wasteful across the 4 upload calls one
+pipeline run makes (3 stages + report). Cached so the whole run reuses one
+client. Not literally shared with `services/classifier/download.py`'s
+near-identical factory function — separately deployed packages by design
+(see that file's own comment) — so this is a deliberate small duplication,
+not an oversight.
+
+`connect_timeout=5` + `retries={"max_attempts": 2}` on the client's `Config`
+— the boto3 default connect timeout is 60 seconds; without shortening it, a
+MinIO outage would hang the whole pipeline for a minute per upload attempt
+instead of failing fast into the local-fallback path below.
+
+### Parallel uploads within a stage
+
+```python
+with ThreadPoolExecutor(max_workers=min(8, len(files))) as pool:
+    list(pool.map(_upload_one, files))
+```
+
+The FP32 stage alone uploads the full model file plus several tokenizer
+files — uploading them one at a time sequentially left the pipeline waiting
+on network I/O for no reason, since the files are fully independent.
+`boto3` clients are thread-safe for concurrent calls, so a `ThreadPoolExecutor`
+is sufficient (no need for `asyncio`/`aioboto3`). `list(pool.map(...))`
+forces the map to fully evaluate and **re-raises the first exception** it
+hits — this preserves the old sequential loop's behavior of failing the
+whole stage on any single file's upload error, now just running the happy
+path in parallel.
+
+### `upload_stage` and `upload_report` never raise — they return `None`
+
+Both catch `(BotoCoreError, ClientError, OSError)` internally and log a
+warning instead of propagating. This is deliberate: a MinIO outage
+shouldn't take down the whole optimization run — the pipeline still
+produces valid local artifacts and a local `report.json`; only the "survive
+pod termination" property is lost for that run. `pipeline.py` checks the
+return value (`None` = failure) to decide whether to register the MinIO
+path or fall back to the local path — see `pipeline.py`'s `minio_ok` section
+below.
+
+---
+
+## registry.py
+
+### `register_model()` takes a connection, not a DSN
+
+```python
+def register_model(conn: psycopg.Connection, run_id: str, model_path: str, threshold: float = 0.5) -> None:
+```
+
+Earlier this opened its own `psycopg.connect()` per call. `pipeline.py`
+only calls it once per run today, but the signature was changed to accept
+an already-open `conn` because a pipeline run legitimately might need to
+register more than once (e.g. a retry after a partial failure, or future
+per-stage registration) — every `psycopg.connect()` costs a TCP handshake
+plus auth round-trip, so the caller now opens **one** connection for the
+whole run (`with psycopg.connect(DSN) as conn:` in `pipeline.py`) and passes
+it down, rather than each callee opening its own. `DSN` was renamed from a
+private `_DSN` to a public export specifically so `pipeline.py` could import
+and use it for that one connection.
+
+`ON CONFLICT (model_version) DO NOTHING` — makes registration idempotent if
+the pipeline (or a retried Airflow task) calls it twice for the same
+`run_id`. Status is unconditionally `'staging'`; nothing in this pipeline
+ever writes `'active'` — that transition is exclusively Airflow's job per
+`CLAUDE.md`'s Model Registry Source of Truth section.
+
+---
+
+## `__main__.py`
+
+```bash
+python -m pipelines.optimizer --model-id VijayRam1812/content-classifier-roberta --output-dir models/
+```
+
+A dedicated `__main__.py` rather than the `if __name__ == "__main__":` block
+living in `pipeline.py` itself — lets the module be run as
+`python -m pipelines.optimizer` (the package) instead of
+`python -m pipelines.optimizer.pipeline` (a specific file inside it). This
+is the more standard invocation for a package meant to be run as a unit —
+matches how `python -m pytest`, `python -m http.server`, etc. work — and
+keeps `pipeline.py` purely a library module (importable by Airflow as a
+plain `run()` function call, with argument parsing living only at the CLI
+boundary).
+
+---
+
 ## pipeline.py
 
 ### Run ID
@@ -208,21 +318,71 @@ Logging is configured here and nowhere else. The stage modules use `logging.getL
 
 ```python
 stages = [
-    ("export",   lambda: export(model_id, run_artifacts / "fp32", opset=opset)),
-    ("optimize", lambda: optimize(run_artifacts / "fp32", run_artifacts / "o2")),
-    ("quantize", lambda: quantize(run_artifacts / "o2", run_artifacts / "int8")),
+    ("export",   lambda: export(model_id, run_artifacts / "fp32", opset=opset), "fp32"),
+    ("optimize", lambda: optimize(run_artifacts / "fp32", run_artifacts / "o2"), "o2"),
+    ("quantize", lambda: quantize(run_artifacts / "o2", run_artifacts / "int8"), "int8"),
 ]
 ```
 
-A list of `(name, callable)` pairs instead of three separate blocks. Adding a new stage is one line. In Phase 7 when this becomes an Airflow DAG, each tuple maps directly to one `PythonOperator` and the stage name becomes the task ID.
+A list of `(name, callable, dir_name)` triples instead of three separate
+blocks — the third element (`dir_name`) doubles as both the local
+subdirectory the stage writes to and the MinIO key prefix
+(`upload_stage(run_id, dir_name, ...)`), so the bucket layout mirrors the
+local `models/<run-id>/` tree exactly without a second naming scheme to keep
+in sync. Adding a new stage is one line. In Phase 7 when this becomes an
+Airflow DAG, each triple maps directly to one `PythonOperator`/
+`KubernetesPodOperator` and the stage name becomes the task ID.
+
+### MinIO upload + registration, and the local-fallback path
+
+After each stage's callable runs, `upload_stage()` is called immediately
+(see `upload.py` above) and its return value is folded into
+`report["stages"][name]["minio_path"]`. A module-level `minio_ok` flag
+starts `True` and flips to `False` the first time any stage's upload
+returns `None` (MinIO unreachable).
+
+After all three stages complete, `model_path` — the value that ends up in
+`model_registry.model_path`, and what the classifier's `download.py`
+actually fetches on pod startup — is derived like this:
+
+```python
+if minio_ok:
+    model_path = f"{report['stages']['quantize']['minio_path']}/model_quantized.onnx"
+else:
+    model_path = str(run_artifacts / "int8")  # local fallback
+```
+
+Deliberately built from the quantize stage's **actual** `upload_stage()`
+return value rather than re-deriving `f"models/{run_id}/int8"` by hand — an
+earlier version hardcoded the `"models"` bucket-name prefix here a second
+time, which risked silently diverging from `upload.py`'s real
+`MINIO_BUCKET` env var if that were ever set to something other than
+`"models"` (bug tracked as #35). Reading it back out of the report the
+upload step already wrote means there's exactly one place the bucket name
+is resolved.
+
+The local-fallback branch means a MinIO outage doesn't stop `register_model`
+from recording that *a* run happened — the registry entry just won't be
+resolvable by any other pod (only the machine that ran the pipeline has that
+local path), so it's logged with a warning, not silently treated as normal.
 
 ### `report.json`
 
-Records per-stage duration and output path for every run. This file is the contract between the optimizer and the evaluate pipeline — `benchmark.py` and `validate.py` read it to find the INT8 checkpoint without hardcoded paths. In Phase 7 it becomes the schema for what gets logged to MLflow.
+Records per-stage duration, output path, and MinIO path for every run,
+plus a top-level `model_path` mirroring whatever was actually registered.
+This file is the contract between the optimizer and the evaluation
+pipeline — `benchmark.py`/`validate.py` read it (indirectly, via
+`--model-dir`) to find the INT8 checkpoint without hardcoded paths. It's
+also uploaded to MinIO itself (`upload_report()`) after being written
+locally, so it survives pod termination the same way the model artifacts
+do. In Phase 7 it becomes the schema for what gets logged to MLflow.
 
-### `if __name__ == "__main__"`
+### Kept importable, not just runnable
 
-Makes the script both runnable directly and importable. Airflow can call `run()` as a Python function without spawning a subprocess. Running directly:
+`pipeline.py` itself has no `if __name__ == "__main__":` block anymore — CLI
+parsing lives entirely in `__main__.py` (see above). `run()` stays a plain
+function so Airflow can call it directly as a Python callable without
+spawning a subprocess. Running directly:
 
 ```bash
 uv run python -m pipelines.optimizer \

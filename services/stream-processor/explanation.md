@@ -60,14 +60,20 @@ main.py — poll loop
   │    Parses OTLP JSON → list of span dicts
   │    One span → up to two entries (prompt + response)
   │
-  ├─ POST /classify/batch (persist=False)
-  │    Classifier returns labels + scores
-  │    No classifier-side PG write (stream processor owns PG writes)
+  ├─ chunk texts to CLASSIFY_CHUNK_SIZE (default 64)
+  │
+  ├─ POST /v1/moderations  (X-Sentinel-Skip-Persist: true), one call per chunk
+  │    Classifier returns OpenAI-shaped moderation results
+  │    _moderation_results_to_label_score() maps them to {label, score}
+  │    Header (not a body field) suppresses the classifier's own PG write —
+  │    stream processor owns PG writes for this traffic
   │
   ├─ writer.write_classifications()   → PostgreSQL (all results)
   │    ON CONFLICT DO NOTHING on (span_id, text_type)
   │
   ├─ writer.write_flagged_content()   → MongoDB (harm + 10% safe)
+  │    bulk_write: UpdateOne upsert keyed on (span_id, text_type) when
+  │    span_id is present, InsertOne otherwise — idempotent on redelivery
   │
   └─ consumer.commit()                ← ONLY if all writes succeed
 ```
@@ -79,12 +85,12 @@ main.py — poll loop
 ### At-least-once delivery guarantee
 
 This is the core design principle. Kafka offset commits are manual and happen
-only after both database writes succeed:
+only after `_pg_write()` (which internally writes both PostgreSQL and
+MongoDB) succeeds:
 
 ```python
 try:
-    write_classifications(...)
-    write_flagged_content(...)
+    pg_conn = _pg_write(pg_conn, spans, all_results, model_version, per_span_latency_ms, mongo_db)
 except Exception:
     logger.exception("DB write failed — not committing, Kafka will redeliver")
     continue   # skip consumer.commit()
@@ -97,13 +103,63 @@ the classifier returns a 5xx — the offset is not committed. On restart (or aft
 the session timeout expires), Kafka redelivers the same messages from the last
 committed offset.
 
-**"At-least-once" means the same message can be processed more than once.** The
-`ON CONFLICT DO NOTHING` on the partial unique index `(span_id, text_type) WHERE
-span_id IS NOT NULL` in the `classifications` table prevents duplicate PostgreSQL
-rows on redelivery. MongoDB writes are not deduplicated — a replayed batch may
-produce duplicate `flagged_content` documents for the same span. This is
-acceptable because the retraining pipeline deduplicates by `span_id` before
-training.
+**"At-least-once" means the same message can be processed more than once.**
+Both persistence layers are now idempotent on redelivery: the `ON CONFLICT
+DO NOTHING` on the partial unique index `(span_id, text_type) WHERE span_id
+IS NOT NULL` in the `classifications` table prevents duplicate PostgreSQL
+rows, and `writer.write_flagged_content()`'s `bulk_write` with `UpdateOne`
+upserts (keyed on the same `(span_id, text_type)` pair) makes MongoDB
+redelivery a no-op instead of a duplicate insert too — see `writer.py`'s
+section below for why this changed from a plain `insert_many`.
+
+### `_pg_write()` — reconnect on drop, rollback on poisoned transaction
+
+```python
+def _pg_write(pg_conn, spans, results, model_version, latency_ms, mongo_db) -> psycopg.Connection:
+    try:
+        write_classifications(pg_conn, spans, results, model_version, latency_ms)
+        write_flagged_content(mongo_db, spans, results, model_version, SAFE_SAMPLE_RATE)
+        return pg_conn
+    except psycopg.OperationalError:
+        # connection actually lost — close, reconnect, retry once
+        ...
+    except psycopg.Error:
+        # connection alive but transaction poisoned — roll back so the NEXT
+        # call can use it, then re-raise so THIS batch isn't committed
+        pg_conn.rollback()
+        raise
+```
+
+Two distinct PostgreSQL failure modes need different recovery, and
+conflating them was a real bug found by live-testing, not a hypothetical:
+
+1. **`psycopg.OperationalError`** — the connection itself is gone (network
+   drop, PG pod restart). Recovery: close the dead connection, open a new
+   one, retry the write once on the fresh connection. If the retry also
+   fails, close that connection too before raising — otherwise a
+   double-failure would leak the second connection silently.
+2. **Any other `psycopg.Error`** (e.g. a constraint violation) — the TCP
+   connection is still perfectly alive, but the **current transaction is
+   aborted**. Every subsequent command on that same connection then fails
+   with `psycopg.errors.InFailedSqlTransaction` until something calls
+   `.rollback()` — psycopg3 doesn't do this automatically. This was
+   reproduced live: a stale `model_version` (the classifier had
+   self-registered a model version the DB didn't actually have a matching
+   row for — see `services/classifier/explanation.md`'s model-registration
+   bug) triggered a `ForeignKeyViolation` on `classifications`. Before this
+   fix, that left the long-lived `pg_conn` permanently poisoned — **every
+   subsequent poll cycle's write failed the same way forever**, not just
+   the one batch that hit the actual FK violation, because nothing ever
+   rolled back the aborted transaction state. The fix calls
+   `pg_conn.rollback()` in this branch before re-raising: the current
+   batch still correctly fails (so its Kafka offset isn't committed and it
+   gets redelivered), but the connection is usable again for the *next*
+   poll cycle instead of being permanently wedged.
+
+`ON CONFLICT DO NOTHING` on `(span_id, text_type)` makes the retry-after-
+reconnect path idempotent — if the first attempt's `write_classifications`
+partially succeeded before the connection dropped, replaying it on the new
+connection just no-ops on the rows that already landed.
 
 ### `consumer.poll()` vs iterating the consumer
 
@@ -124,11 +180,12 @@ consumer.commit()  # commits all fetched offsets at once
 ```
 
 The stream processor uses `poll()` for batching. Instead of classifying one span
-per HTTP request, it collects all spans from a full poll cycle and sends them in
-a single `/classify/batch` call. This is significantly more efficient:
-- One HTTP round-trip per poll cycle instead of one per message
+per HTTP request, it collects all spans from a full poll cycle and sends them
+in one or more `/v1/moderations` calls (chunked to `CLASSIFY_CHUNK_SIZE`, see
+above). This is significantly more efficient:
+- A small, bounded number of HTTP round-trips per poll cycle instead of one per message
 - One `executemany` INSERT instead of one per row
-- One MongoDB `insert_many` instead of one per document
+- One MongoDB `bulk_write` instead of one operation per document
 
 **`timeout_ms=1000`** — if no messages are available, `poll()` blocks for up to
 1 second then returns an empty dict. The `while _running` loop immediately calls
@@ -136,12 +193,13 @@ a single `/classify/batch` call. This is significantly more efficient:
 heartbeat thread time to fire (keeping the consumer group session alive).
 
 **`max_records=50`** — caps the batch size from Kafka per poll call. Without
-this, a backlogged topic could deliver hundreds of messages in one poll, making
-the subsequent `/classify/batch` call too large (exceeds `MAX_BATCH_SIZE=64`).
-At 50 records, and assuming each OTLP message contains one LLM span with both
-prompt and response, the worst case is 100 texts per classify call — the stream
-processor uses the full `MAX_BATCH_SIZE=64` on the first call and leftovers on a
-second if needed. In practice, the `MAX_POLL_RECORDS` env var lets you tune this.
+this, a backlogged topic could deliver hundreds of messages in one poll,
+producing an unbounded number of texts to classify at once. At 50 records,
+and assuming each OTLP message contains one LLM span with both prompt and
+response, the worst case is 100 texts per poll cycle — split into two
+`CLASSIFY_CHUNK_SIZE=64`-sized chunks (64 + 36) rather than one oversized
+call that would 422. In practice, the `MAX_POLL_RECORDS` env var lets you
+tune this.
 
 ### KafkaConsumer configuration
 
@@ -153,7 +211,7 @@ consumer = KafkaConsumer(
     enable_auto_commit=False,
     auto_offset_reset="earliest",
     value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-    request_timeout_ms=30_000,
+    request_timeout_ms=40_000,
     session_timeout_ms=30_000,
     heartbeat_interval_ms=10_000,
 )
@@ -183,9 +241,12 @@ sends a heartbeat every 10 seconds — well within the 30-second timeout. A slow
 DB write (which blocks the poll loop) can cause missed heartbeats and unintentional
 rebalances. If DB writes consistently take > 20 seconds, increase `session_timeout_ms`.
 
-**`request_timeout_ms=30_000`** — the maximum time to wait for a response to any
-Kafka API request (fetch, produce, metadata). Keep this larger than
-`session_timeout_ms`.
+**`request_timeout_ms=40_000`** — the maximum time to wait for a response to any
+Kafka API request (fetch, produce, metadata). Kept larger than
+`session_timeout_ms` (30s) — a request timeout shorter than or equal to the
+session timeout risks the client giving up on a slow-but-alive broker
+response right around the same time a rebalance would otherwise trigger,
+compounding the two failure modes instead of keeping them independent.
 
 ### Signal handling
 
@@ -211,34 +272,98 @@ Without signal handling, Ctrl-C raises a `KeyboardInterrupt` that would skip
 the `consumer.close()` call. Kafka would wait 30 seconds (session timeout)
 before reassigning the partitions to another consumer — making restarts slow.
 
-### `persist=False` on the classify call
+### `/v1/moderations`, not `/classify/batch` — dogfooding the public endpoint
 
 ```python
-resp = http.post("/classify/batch", json={"texts": texts, "persist": False})
+resp = http.post(
+    "/v1/moderations",
+    json={"input": chunk},
+    headers={"X-Sentinel-Skip-Persist": "true"},
+)
 ```
 
-Without this flag, the classifier would also write to PostgreSQL asynchronously
-(`asyncio.create_task`). The stream processor would still write its own rows,
-producing duplicates. More critically, the classifier's async write is
-fire-and-forget — it completes after the HTTP response, meaning the stream
-processor cannot know if it succeeded before committing the Kafka offset.
+The stream processor calls the classifier's **OpenAI-compatible**
+`/v1/moderations` endpoint — the same one any external integration would
+use — rather than a Sentinel-internal `/classify/batch` shape. This is a
+deliberate architectural decision (see `CLAUDE.md`'s OTel GenAI semantic
+conventions section): the project's own highest-volume internal traffic
+exercises exactly the code path external callers get, instead of treating
+`/classify/batch` as the "real" endpoint and `/v1/moderations` as a thin
+facade nobody but external callers actually hits. If `/v1/moderations` ever
+broke, the stream processor's own traffic would surface it immediately in
+local dev, rather than only being caught when an external caller notices.
 
-`persist=False` gives the stream processor full control over when PG writes
-happen relative to the offset commit. The classifier becomes a pure inference
-service for this call path.
+**This decision was accidentally reverted once, mid-session, and caught by
+the user asking "isnt the /classify/batch endpoint modified to be
+/v1/moderations?"** — a fix for an unrelated issue moved this call back to
+`/classify/batch`, undoing a deliberate choice from an earlier commit
+without checking `git log`/`git blame` first. The lesson generalizes: before
+"fixing" something that touches an existing, working call path, check
+whether its current shape was a deliberate decision (commit message, code
+comment, or explanation.md note) rather than an oversight — matching an
+older pattern isn't automatically correct if the code moved past it on
+purpose.
+
+**`_moderation_results_to_label_score()`** translates `/v1/moderations`'
+OpenAI-shaped `{flagged, categories, category_scores}` results into this
+service's internal `{label, score}` shape that `writer.py`'s functions
+expect — named and factored out explicitly (not an inline dict comprehension
+at the call site) so the translation reads as a deliberate boundary: calling
+an OpenAI-compatible endpoint from internal code makes this remapping
+inherent, not incidental, and worth a name.
+
+**Skip-persist via `X-Sentinel-Skip-Persist` header, not a `persist` body
+field.** Without suppressing it, the classifier would also write to
+PostgreSQL asynchronously from inside `/v1/moderations` — the stream
+processor would still write its own rows too, producing duplicates. Earlier
+this was a `persist: bool` field on the request body (mirroring
+`/classify/batch`'s still-present `persist` field). It moved to a header
+specifically so `ModerationRequest` — the schema an external
+`openai.moderations.create()`-style caller sends — stays a clean,
+zero-Sentinel-internals OpenAI-compatible shape; see
+`services/classifier/explanation.md`'s `/v1/moderations` section for the
+full reasoning from the classifier side.
+
+### Chunking to the classifier's batch limit
+
+```python
+chunks = [texts[i : i + CLASSIFY_CHUNK_SIZE] for i in range(0, len(texts), CLASSIFY_CHUNK_SIZE)]
+```
+
+A single Kafka poll (`max_records=50`) can extract more spans than the
+classifier accepts in one request — up to 100 texts if every message has
+both a prompt and a response. `CLASSIFY_CHUNK_SIZE` (default `64`, env var)
+splits the poll's texts into `/v1/moderations`-sized chunks, one HTTP call
+per chunk, results concatenated back into `all_results`.
+
+**Not read from the same env var name as the classifier's own limit** —
+`CLASSIFY_CHUNK_SIZE` here vs `MAX_BATCH_SIZE` in
+`services/classifier/config.py` — because these are two separately deployed
+services with independent configuration surfaces; sharing an env var name
+across service boundaries would be an implicit, easy-to-break coupling. Both
+default to `64` today, but if either is tuned away from that default, the
+other has to be set explicitly too — nothing enforces they stay in sync
+automatically. Exceeding the classifier's real limit gets a `422` from
+Pydantic's `max_length` validation on `ModerationRequest.input`, which
+`resp.raise_for_status()` below turns into a Kafka-redelivery retry rather
+than a silent data loss.
 
 ### `per_span_latency_ms`
 
 ```python
-per_span_latency_ms = body["latency_ms"] / max(len(texts), 1)
+per_span_latency_ms = classify_ms_total / max(len(texts), 1)
 ```
 
-The batch endpoint returns a single `latency_ms` for the entire batch. There is
-no per-span latency. Dividing by batch size is an approximation: it assumes the
-batch processed all texts in parallel, which is true for the ORT matrix multiply
-but not for tokenization or Python overhead. It gives a reasonable per-span
-estimate to store in the `classifications` table's `latency_ms` column, which
-is used for latency trend analysis in the drift detection phase.
+`classify_ms_total` accumulates wall-clock time across every chunk's HTTP
+call in this poll cycle (there can be more than one now, per the chunking
+above) — not a single batch's `latency_ms` field. Dividing by the total
+span count across all chunks gives a reasonable per-span estimate to store
+in the `classifications` table's `latency_ms` column, which is used for
+latency trend analysis in the drift detection phase. Same caveat as before:
+this assumes even latency distribution across spans within and across
+chunks, which is true for the ORT matrix multiply's parallelism but not
+exactly for tokenization or per-request Python/HTTP overhead — a reasonable
+approximation, not an exact per-span measurement.
 
 ### httpx `Client` (not `AsyncClient`)
 
@@ -411,8 +536,20 @@ for span, result in zip(spans, results):
     if label == "harm" or random.random() < safe_sample_rate:
         docs.append({...})
 
-if docs:
-    db.flagged_content.insert_many(docs)
+if not docs:
+    return
+
+operations = [
+    pymongo.UpdateOne(
+        {"span_id": doc["span_id"], "text_type": doc["text_type"]},
+        {"$set": doc},
+        upsert=True,
+    )
+    if doc["span_id"]
+    else pymongo.InsertOne(doc)
+    for doc in docs
+]
+result = db.flagged_content.bulk_write(operations, ordered=False)
 ```
 
 **Why not write everything to MongoDB?** The `flagged_content` collection is the
@@ -428,14 +565,28 @@ actual traffic distribution). The ratio is tunable via `SAFE_SAMPLE_RATE` env va
 For very low-traffic early deployments where harm examples are rare, consider
 `SAFE_SAMPLE_RATE=0.5` (50%) until you accumulate enough harm examples to balance.
 
-**`insert_many` is not idempotent** — MongoDB's `insert_many` does not have a
-built-in equivalent of `ON CONFLICT DO NOTHING`. On Kafka redelivery, the same
-span may produce duplicate documents in `flagged_content`. This is acceptable:
-- Duplicates are a small fraction of total documents (only during replay).
-- The retrain pipeline deduplicates by `span_id` when building the training set.
-- Adding a unique index on `(span_id, text_type)` in MongoDB would make
-  `insert_many` fail on conflict unless `ordered=False` is set. A future hardening
-  step could add this.
+**`bulk_write` with per-document upsert, not `insert_many` — MongoDB writes
+are now idempotent too.** This replaced a plain `insert_many(docs)` call.
+The old version was explicitly documented as non-idempotent ("a replayed
+batch may produce duplicate `flagged_content` documents") on the reasoning
+that the retrain pipeline would dedupe by `span_id` later anyway — accepted
+as a known gap rather than fixed. It was fixed: each document with a
+non-null `span_id` becomes a `pymongo.UpdateOne` filtered on
+`{span_id, text_type}` with `upsert=True` — the same natural key as
+PostgreSQL's partial unique index — so redelivering the same span overwrites
+the same document instead of inserting a second one. Documents with no
+`span_id` (same gap as the PostgreSQL side: nothing to dedupe on) fall back
+to a plain `pymongo.InsertOne`.
+
+**`ordered=False` on `bulk_write`** — with the default `ordered=True`,
+MongoDB stops processing the batch at the first failing operation, leaving
+every operation after it un-run even if they'd have succeeded independently.
+`ordered=False` lets every operation attempt independently, so one bad
+document doesn't block the rest of an otherwise-healthy batch from
+committing — a partial failure then only leaves the genuinely-failed
+documents to be retried on redelivery, and every other document in the
+batch is already a safe upsert that won't duplicate when that redelivery
+happens.
 
 **Document shape:**
 
@@ -470,6 +621,7 @@ context when investigating a flagged document.
 | `MONGO_URI` | `mongodb://sentinel:sentinel@localhost:27017/sentinel` | MongoDB connection URI |
 | `SAFE_SAMPLE_RATE` | `0.1` | Fraction of safe spans stored in MongoDB |
 | `MAX_POLL_RECORDS` | `50` | Max messages per Kafka poll call |
+| `CLASSIFY_CHUNK_SIZE` | `64` | Max texts per `/v1/moderations` call — must not exceed the classifier's own `MAX_BATCH_SIZE` (separate env var, separate service; keep both in sync manually if either is tuned) |
 
 ---
 
@@ -504,6 +656,10 @@ kubectl exec -n sentinel-data statefulset/kafka -- \
 **Tune throughput** — the main levers:
 - `MAX_POLL_RECORDS`: larger batches → fewer HTTP calls → higher throughput,
   but larger memory spikes and longer time between offset commits.
+- `CLASSIFY_CHUNK_SIZE`: raising this reduces the number of `/v1/moderations`
+  calls per poll cycle, but must stay ≤ the classifier's `MAX_BATCH_SIZE` or
+  every oversized chunk 422s and the whole poll cycle fails (Kafka redelivers
+  forever until the mismatch is fixed).
 - `SAFE_SAMPLE_RATE`: lower value → fewer MongoDB writes → higher throughput.
 - `session_timeout_ms`: increase if slow DB writes cause rebalances.
 - Kafka partitions: currently 3. To scale beyond 3 stream processor replicas,
