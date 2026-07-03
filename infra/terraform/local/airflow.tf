@@ -48,6 +48,29 @@ resource "kubernetes_config_map" "airflow_dags" {
   }
 }
 
+# Static Flask secret key for the webserver (signs session cookies). Without
+# this, the chart auto-generates a fresh random key on every deploy — every
+# `terraform apply` that touches the release invalidates all sessions and
+# the UI shows a persistent "dynamic webserver secret key" warning banner.
+# Key name inside the secret (webserver-secret-key) is fixed by the chart —
+# see templates/_helpers.yaml's webserver_secret_key_secret definition.
+resource "kubernetes_secret" "airflow_webserver_secret_key" {
+  metadata {
+    # Not "airflow-webserver-secret-key" — the chart's own auto-generated
+    # secret (created back when webserverSecretKeySecretName was unset) is
+    # already sitting at that exact name (its naming convention is
+    # {{ airflow.fullname }}-webserver-secret-key). A different name avoids
+    # the collision; the chart stops rendering its own version of this
+    # resource once webserverSecretKeySecretName is set below, and Helm
+    # prunes the now-orphaned one on this upgrade.
+    name      = "airflow-webserver-secret-key-static"
+    namespace = kubernetes_namespace.sentinel["sentinel-pipeline"].metadata[0].name
+  }
+  data = {
+    webserver-secret-key = var.airflow_webserver_secret_key
+  }
+}
+
 # Scheduler's identity — LocalExecutor runs tasks as scheduler subprocesses,
 # so this is the identity that needs permission to trigger a rollout restart
 # (added once the retrain DAG's promotion task lands in Phase 7.3; granted
@@ -111,6 +134,8 @@ resource "helm_release" "airflow" {
 
   values = [yamlencode({
     executor = "LocalExecutor"
+
+    webserverSecretKeySecretName = kubernetes_secret.airflow_webserver_secret_key.metadata[0].name
 
     # No Celery in this phase — LocalExecutor doesn't use them.
     redis  = { enabled = false }
@@ -188,5 +213,8 @@ resource "helm_release" "airflow" {
     }
   })]
 
-  depends_on = [kubernetes_config_map.airflow_dags]
+  depends_on = [
+    kubernetes_config_map.airflow_dags,
+    kubernetes_secret.airflow_webserver_secret_key,
+  ]
 }

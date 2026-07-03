@@ -75,6 +75,13 @@ variable "kafka_storage_size" {
   default     = "2Gi"
 }
 
+variable "airflow_webserver_secret_key" {
+  description = "Static Flask secret key for the Airflow webserver — signs session cookies. Without one, the chart auto-generates a fresh key on every deploy, invalidating every session and showing a dashboard warning."
+  type        = string
+  sensitive   = true
+  default     = "sentinel-dev-only-static-webserver-secret-key"
+}
+
 variable "airflow_admin_password" {
   description = "Airflow webserver admin user password"
   type        = string
