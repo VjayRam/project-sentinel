@@ -3,8 +3,10 @@
 Consuming loop:
   1. Poll traces.raw for a batch of OTLP JSON messages.
   2. Parse each message to extract LLM spans (prompt + response text).
-  3. POST /v1/moderations with persist=False — classifier returns labels without
-     writing to PG itself (we handle PG writes here with span_id for idempotency).
+  3. POST /v1/moderations (X-Sentinel-Skip-Persist: true) — the same
+     OpenAI-compatible endpoint external callers use, so our own highest-
+     volume traffic exercises it too. Classifier skips its own PG write;
+     we handle PG writes here with span_id for idempotency.
   4. Write all results to PostgreSQL classifications.
   5. Write harm + sampled safe to MongoDB flagged_content.
   6. Commit Kafka offset ONLY after both writes succeed.
@@ -54,6 +56,20 @@ def _handle_signal(sig, frame):
     global _running
     logger.info("Received signal %d — shutting down", sig)
     _running = False
+
+
+def _moderation_results_to_label_score(results: list[dict]) -> list[dict]:
+    """Translate /v1/moderations' OpenAI-compatible result shape into this
+    service's internal {label, score} shape (what write_classifications and
+    write_flagged_content expect). Named explicitly rather than an inline
+    remap so the translation is a visible, intentional boundary — calling
+    the OpenAI-compatible endpoint from internal code means this mapping is
+    inherent, not something to hide.
+    """
+    return [
+        {"label": "harm" if r["flagged"] else "safe", "score": r["category_scores"]["harm"]}
+        for r in results
+    ]
 
 
 def _pg_connect() -> psycopg.Connection:
@@ -160,18 +176,23 @@ def run() -> None:
                 for i in range(0, len(texts), CLASSIFY_CHUNK_SIZE)
             ]
 
-            # persist=False: skip classifier's own PG write; we write here with span_id.
-            # Uses /classify/batch (not /v1/moderations) — it returns
-            # {label, score} directly instead of the OpenAI-compatible
-            # flagged/category_scores.harm shape, so there's no response
-            # remapping tying this consumer to that wire format.
+            # Calls /v1/moderations (not /classify/batch) deliberately — this
+            # is the same OpenAI-compatible endpoint external callers use, so
+            # our own highest-volume internal traffic exercises that exact
+            # code path (see CLAUDE.md's OTel GenAI conventions section).
+            # X-Sentinel-Skip-Persist replaces the classifier's own PG write:
+            # we write here ourselves with span_id for idempotency.
             all_results: list[dict] = []
             classify_ms_total = 0.0
             model_version = ""
             try:
                 for chunk in chunks:
                     t0 = time.perf_counter()
-                    resp = http.post("/classify/batch", json={"texts": chunk, "persist": False})
+                    resp = http.post(
+                        "/v1/moderations",
+                        json={"input": chunk},
+                        headers={"X-Sentinel-Skip-Persist": "true"},
+                    )
                     if not resp.is_success:
                         logger.error(
                             "Classify HTTP %d — body: %s | chunk=%d texts",
@@ -182,8 +203,8 @@ def run() -> None:
                     resp.raise_for_status()
                     classify_ms_total += (time.perf_counter() - t0) * 1000
                     body = resp.json()
-                    model_version = body["model_version"]
-                    all_results.extend(body["results"])
+                    model_version = body["model"]
+                    all_results.extend(_moderation_results_to_label_score(body["results"]))
             except Exception:
                 logger.exception("Classify failed — not committing, Kafka will redeliver")
                 continue

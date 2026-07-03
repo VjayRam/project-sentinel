@@ -10,7 +10,7 @@ import db as _db
 from batcher import DynamicBatcher
 from config import settings
 from download import download_model
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from metrics import BATCH_SIZE, REQUEST_COUNT, REQUEST_LATENCY, attach_log_handler
 from model import Classifier
 from prometheus_client import make_asgi_app
@@ -253,19 +253,26 @@ async def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse
 
 
 @app.post("/v1/moderations", response_model=ModerationResponse)
-async def moderate(request: ModerationRequest) -> ModerationResponse:
+async def moderate(
+    request: ModerationRequest,
+    x_sentinel_skip_persist: bool = Header(False, alias="X-Sentinel-Skip-Persist"),
+) -> ModerationResponse:
     """OpenAI Moderation API-compatible endpoint.
 
     Accepts a single string or a list of strings and returns one ModerationResult
     per input in the same order. Drop-in compatible with openai.moderations.create().
+
+    The stream processor calls this endpoint too (not /classify/batch) so
+    internal traffic exercises the same code path production callers use.
+    It skips classifier-side persistence via the X-Sentinel-Skip-Persist
+    header (it writes to PG itself, with span_id for idempotency) rather
+    than a body field — ModerationRequest stays a clean OpenAI-compatible
+    schema with no Sentinel-internal fields visible to external callers.
     """
     texts = [request.input] if isinstance(request.input, str) else list(request.input)
-    # Always persists — this is the public OpenAI-compatible surface, so it
-    # doesn't carry a Sentinel-internal skip-persistence knob (see schemas.py:
-    # ModerationRequest used to have a `persist` field for exactly that; the
-    # stream processor now calls /classify/batch instead, which still has one
-    # since that endpoint is explicitly internal/testing-only).
-    results, _, _ = await _classify_and_persist(texts, "moderations", persist=True)
+    results, _, _ = await _classify_and_persist(
+        texts, "moderations", persist=not x_sentinel_skip_persist
+    )
 
     return ModerationResponse(
         id=f"modr-{uuid.uuid4().hex[:12]}",
