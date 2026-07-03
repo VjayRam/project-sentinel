@@ -141,25 +141,37 @@ def write_drift_stats(
 
 
 def get_active_model_version(database_url: str) -> str | None:
-    """Return the model_version model_registry considers current.
+    """Return the model_version that's actually appearing in classifications.
 
-    Mirrors services/classifier/db.py's get_active_model selection exactly
-    (prefer status='active', fall back to the most recent 'staging' entry) so
-    the drift job evaluates the same version a classifier pod would load on
-    startup. Reading from `classifications` instead (whichever version wrote
-    the most recent row) was a race during rolling restarts: old- and
-    new-version pods write concurrently, so "most recent row" doesn't mean
-    "the rollout's target version" — it could attribute drift_stats to a
-    version that's already being retired.
+    Live-verified gotcha this has to account for: model_registry holds two
+    different kinds of rows that don't share a model_version namespace.
+    services/classifier/db.py's get_active_model() picks a 'active'/'staging'
+    row to decide which MinIO model_path to download — but once loaded, the
+    classifier self-registers a *separate*, new 'staging' row under its own
+    freshly-derived model_version string (services/classifier/model.py's
+    `sentinel-roberta-{deployed_at}-{quant_tag}`), and THAT string — not the
+    row it downloaded from — is what ends up in classifications.model_version
+    on every write. An earlier version of this function mirrored
+    get_active_model()'s "prefer status='active'" ordering exactly, which
+    seemed principled but was wrong in practice: reproduced live against a
+    real cluster, the 'active' row was a stale promotion from a different
+    model_version string entirely (nothing in this project's current phase —
+    Airflow/Phase 7 doesn't exist yet — reliably keeps 'active' pointed at
+    what's actually running), so it returned a model_version with zero
+    matching classification rows and drift detection silently found nothing.
+    Ordering by created_at alone — "whichever pod self-registered most
+    recently" — is what's actually running and writing classifications.
+    Still scoped to non-retired rows; still subject to the same rolling-
+    restart race noted before (old- and new-version pods can both register
+    around the same moment), just no longer compounded by a status
+    preference that points at the wrong namespace entirely.
     """
     with _connect(database_url) as conn:
         row = conn.execute(
             """
             SELECT model_version FROM model_registry
             WHERE status IN ('active', 'staging')
-            ORDER BY
-                CASE status WHEN 'active' THEN 0 ELSE 1 END,
-                COALESCE(promoted_at, created_at) DESC
+            ORDER BY created_at DESC
             LIMIT 1
             """,
         ).fetchone()

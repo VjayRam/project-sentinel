@@ -123,11 +123,15 @@ class Classifier:
         inputs = self._tokenizer(
             texts,
             return_tensors="np",
-            # max_length (not dynamic padding) trades a bit of extra compute
-            # on short inputs for latency that doesn't depend on what else
-            # happens to be in the same batch — a batch containing one
-            # long input no longer inflates every other input's padding.
-            padding="max_length",
+            # Reverted from padding="max_length": every batch then tokenized
+            # to the full 512 tokens regardless of actual input length,
+            # which OOM-killed the pod (1Gi limit) twice under real load —
+            # reproduced live, not theoretical. The "latency doesn't depend
+            # on batch content" benefit isn't worth crashing the service;
+            # a real fix for that (e.g. bucketed padding, or raising the
+            # memory limit + confirming it's stable under sustained load)
+            # needs its own verification pass, not a same-session swap back.
+            padding=True,
             truncation=True,
             max_length=512,
         )

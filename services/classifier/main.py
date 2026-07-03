@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
     # The registry is the source of truth for which model version to serve.
     # Open the pool first so we can query it before loading the model.
     model_dir: Path | None = None
+    active: dict | None = None
 
     if settings.database_url:
         try:
@@ -90,28 +91,39 @@ async def lifespan(app: FastAPI):
 
     # ── 3. Record this model version in the registry (idempotent) ─────────────
     # ON CONFLICT DO NOTHING: first pod registers it, subsequent pods skip.
-    # Skip registration when model_path is an absolute local path (this pod
-    # fell back to local model discovery — MODEL_PATH env var or
-    # logs/optimizer/). That path only exists on THIS pod's filesystem;
-    # download.py treats any path starting with "/" as already-materialized
-    # and never fetches it from MinIO, so writing it to the shared registry
-    # would hand a different pod a path that doesn't exist on its own
-    # filesystem, crashing it on startup. Leaving the registry untouched
-    # here means other pods fall through to their own local discovery too,
-    # which is at least self-consistent per pod.
-    if _pool and not _classifier.model_path.startswith("/"):
+    #
+    # Register the ORIGINAL MinIO-backed path (active["model_path"]) when we
+    # resolved via a successful MinIO download — NOT _classifier.model_path.
+    # download_model() always caches the downloaded model under a local
+    # directory (/tmp/sentinel-model-cache/...), so _classifier.model_path
+    # is *always* an absolute local path, even for a MinIO-backed model.
+    # Checking model_path.startswith("/") here (an earlier version of this
+    # check) therefore skipped registration for the common case too, not
+    # just genuine local-only fallback — every classification write then
+    # violated classifications_model_version_fkey, since the model_version
+    # never existed in model_registry. Reproduced live: confirmed via
+    # kubectl logs that a classifier pod loading a real MinIO-backed model
+    # still hit "Skipping registry write" and every subsequent /v1/moderations
+    # persist attempt failed with psycopg.errors.ForeignKeyViolation.
+    #
+    # `model_dir is not None` is the correct portability signal: it's only
+    # None when Classifier() fell through to _resolve_model_dir() itself
+    # (MODEL_PATH env var or logs/optimizer/ found locally) — that's the
+    # genuine non-portable case docs/local-dev.md and this comment used to
+    # describe, and it's the only one that should skip registration.
+    if _pool and model_dir is not None and active is not None:
         try:
             await _db.register_model(
                 _pool,
                 _classifier.model_version,
-                _classifier.model_path,
+                active["model_path"],
                 _classifier.threshold,
             )
         except Exception:
             logger.exception("Failed to register model version in registry")
     elif _pool:
         logger.info(
-            "Skipping registry write — model_path is a local filesystem path, "
+            "Skipping registry write — resolved via local fallback, "
             "not portable across pods | path=%s",
             _classifier.model_path,
         )
