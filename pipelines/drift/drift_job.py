@@ -94,9 +94,7 @@ def main() -> None:
     )
 
     # ── read scores from PostgreSQL ───────────────────────────────────────────
-    ref_scores = read_reference_scores(
-        args.database_url, model_version, size=args.reference_size
-    )
+    ref_scores = read_reference_scores(args.database_url, model_version, size=args.reference_size)
     if len(ref_scores) < MIN_REFERENCE_SIZE:
         # Too few rows to build a meaningful reference distribution — with this
         # little data, epsilon-smoothing dominates the reference histogram and

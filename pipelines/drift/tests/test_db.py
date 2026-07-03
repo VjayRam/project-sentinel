@@ -18,6 +18,7 @@ skip_no_db = pytest.mark.skipif(not DB_URL, reason="DATABASE_URL not set")
 @skip_no_db
 def test_get_active_model_version_returns_string():
     from db import get_active_model_version
+
     version = get_active_model_version(DB_URL)
     assert isinstance(version, str), f"Expected str, got {type(version)}"
     assert len(version) > 0, "model_version should not be empty"
@@ -26,6 +27,7 @@ def test_get_active_model_version_returns_string():
 @skip_no_db
 def test_read_reference_scores_returns_floats():
     from db import get_active_model_version, read_reference_scores
+
     version = get_active_model_version(DB_URL)
     scores = read_reference_scores(DB_URL, version, size=50)
     assert isinstance(scores, list)
@@ -36,6 +38,7 @@ def test_read_reference_scores_returns_floats():
 @skip_no_db
 def test_read_current_scores_returns_floats_and_window():
     from db import get_active_model_version, read_current_scores
+
     version = get_active_model_version(DB_URL)
     scores, window_start, window_end = read_current_scores(DB_URL, version, hours=24 * 365)
     assert isinstance(scores, list)
@@ -47,7 +50,7 @@ def test_read_current_scores_returns_floats_and_window():
 @skip_no_db
 def test_write_drift_stats_inserts_row():
     import psycopg
-    from db import write_drift_stats, get_active_model_version
+    from db import get_active_model_version, write_drift_stats
 
     version = get_active_model_version(DB_URL)
     now = datetime.now(timezone.utc)

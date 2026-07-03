@@ -36,9 +36,7 @@ def validate(candidate: dict, baseline: dict | None = None) -> tuple[bool, list[
     reasons = []
 
     if candidate["accuracy"] < MIN_ACCURACY:
-        reasons.append(
-            f"accuracy {candidate['accuracy']:.4f} below minimum {MIN_ACCURACY:.4f}"
-        )
+        reasons.append(f"accuracy {candidate['accuracy']:.4f} below minimum {MIN_ACCURACY:.4f}")
 
     if baseline is not None:
         drop = baseline["accuracy"] - candidate["accuracy"]
@@ -54,7 +52,9 @@ def validate(candidate: dict, baseline: dict | None = None) -> tuple[bool, list[
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Gate model promotion on benchmark results")
-    p.add_argument("--candidate", required=True, help="Path to the candidate's benchmark_report.json")
+    p.add_argument(
+        "--candidate", required=True, help="Path to the candidate's benchmark_report.json"
+    )
     p.add_argument(
         "--baseline",
         default=None,

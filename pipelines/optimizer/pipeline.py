@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import psycopg
+
 from pipelines.optimizer.export import export
 from pipelines.optimizer.optimize import optimize
 from pipelines.optimizer.quantize import quantize

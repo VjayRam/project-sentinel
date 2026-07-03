@@ -93,9 +93,11 @@ def compute_drift(
 
     # q = reference proportion, p = current proportion (epsilon-smoothed)
     combined = combined.withColumn(
-        "q", (F.col("ref_count") + _EPSILON) / (ref_total + n_bins * _EPSILON),
+        "q",
+        (F.col("ref_count") + _EPSILON) / (ref_total + n_bins * _EPSILON),
     ).withColumn(
-        "p", (F.col("cur_count") + _EPSILON) / (cur_total + n_bins * _EPSILON),
+        "p",
+        (F.col("cur_count") + _EPSILON) / (cur_total + n_bins * _EPSILON),
     )
 
     # ── Step 6: PSI contribution per bin: (p − q) × ln(p / q) ───────────────
@@ -107,7 +109,8 @@ def compute_drift(
     # ── Step 7: JSD contribution per bin ─────────────────────────────────────
     # M = midpoint distribution; JSD = 0.5×KL(P‖M) + 0.5×KL(Q‖M)
     combined = combined.withColumn(
-        "m", (F.col("p") + F.col("q")) / 2.0,
+        "m",
+        (F.col("p") + F.col("q")) / 2.0,
     ).withColumn(
         "jsd_contrib",
         0.5 * F.col("p") * F.log(F.col("p") / F.col("m"))

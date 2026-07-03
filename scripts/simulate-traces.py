@@ -70,9 +70,9 @@ HARM_RESPONSES = [
 
 # (provider, request_model, response_model_suffix)
 MODELS = [
-    ("openai",     "gpt-4o",            "gpt-4o-2024-11-20"),
-    ("openai",     "gpt-4o-mini",       "gpt-4o-mini-2024-07-18"),
-    ("anthropic",  "claude-sonnet-4-6", "claude-sonnet-4-6-20251001"),
+    ("openai", "gpt-4o", "gpt-4o-2024-11-20"),
+    ("openai", "gpt-4o-mini", "gpt-4o-mini-2024-07-18"),
+    ("anthropic", "claude-sonnet-4-6", "claude-sonnet-4-6-20251001"),
 ]
 
 
@@ -114,15 +114,15 @@ def make_span(harm: bool) -> dict:
         "startTimeUnixNano": str(start_ns),
         "endTimeUnixNano": str(now_ns),
         "attributes": [
-            {"key": "gen_ai.system",                 "value": {"stringValue": provider}},
-            {"key": "gen_ai.request.model",           "value": {"stringValue": req_model}},
-            {"key": "gen_ai.request.max_tokens",      "value": {"intValue": max_tokens}},
-            {"key": "gen_ai.request.temperature",     "value": {"doubleValue": temperature}},
-            {"key": "gen_ai.response.model",          "value": {"stringValue": resp_model}},
+            {"key": "gen_ai.system", "value": {"stringValue": provider}},
+            {"key": "gen_ai.request.model", "value": {"stringValue": req_model}},
+            {"key": "gen_ai.request.max_tokens", "value": {"intValue": max_tokens}},
+            {"key": "gen_ai.request.temperature", "value": {"doubleValue": temperature}},
+            {"key": "gen_ai.response.model", "value": {"stringValue": resp_model}},
             {"key": "gen_ai.response.finish_reasons", "value": {"stringValue": finish_reason}},
-            {"key": "gen_ai.usage.input_tokens",      "value": {"intValue": input_tokens}},
-            {"key": "gen_ai.usage.output_tokens",     "value": {"intValue": output_tokens}},
-            {"key": "session.id",                     "value": {"stringValue": session_id}},
+            {"key": "gen_ai.usage.input_tokens", "value": {"intValue": input_tokens}},
+            {"key": "gen_ai.usage.output_tokens", "value": {"intValue": output_tokens}},
+            {"key": "session.id", "value": {"stringValue": session_id}},
         ],
         # Sensitive content goes in span events, not attributes — matches what
         # LangSmith, Arize Phoenix, and opentelemetry-instrumentation-openai emit.
@@ -152,13 +152,16 @@ def send_batch(endpoint: str, spans: list[dict]) -> None:
             {
                 "resource": {
                     "attributes": [
-                        {"key": "service.name",    "value": {"stringValue": "chat-app-simulator"}},
+                        {"key": "service.name", "value": {"stringValue": "chat-app-simulator"}},
                         {"key": "service.version", "value": {"stringValue": "0.1.0"}},
                     ]
                 },
                 "scopeSpans": [
                     {
-                        "scope": {"name": "opentelemetry-instrumentation-openai", "version": "0.1.0"},
+                        "scope": {
+                            "name": "opentelemetry-instrumentation-openai",
+                            "version": "0.1.0",
+                        },
                         "spans": spans,
                     }
                 ],
@@ -178,16 +181,24 @@ def send_batch(endpoint: str, spans: list[dict]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Simulate LLM OTLP traces (GenAI semantic conventions)")
-    parser.add_argument("--count",    type=int,   default=20,                      help="total spans to send")
-    parser.add_argument("--interval", type=float, default=0.5,                     help="seconds between batches")
-    parser.add_argument("--batch",    type=int,   default=2,                       help="spans per batch")
-    parser.add_argument("--harm-pct", type=float, default=0.2,                     help="fraction of spans that are harmful (0.0–1.0)")
-    parser.add_argument("--endpoint", type=str,   default="http://localhost:4318",  help="OTel Collector HTTP endpoint")
+    parser = argparse.ArgumentParser(
+        description="Simulate LLM OTLP traces (GenAI semantic conventions)"
+    )
+    parser.add_argument("--count", type=int, default=20, help="total spans to send")
+    parser.add_argument("--interval", type=float, default=0.5, help="seconds between batches")
+    parser.add_argument("--batch", type=int, default=2, help="spans per batch")
+    parser.add_argument(
+        "--harm-pct", type=float, default=0.2, help="fraction of spans that are harmful (0.0–1.0)"
+    )
+    parser.add_argument(
+        "--endpoint", type=str, default="http://localhost:4318", help="OTel Collector HTTP endpoint"
+    )
     args = parser.parse_args()
 
-    print(f"Sending {args.count} spans to {args.endpoint} "
-          f"({args.harm_pct * 100:.0f}% harmful, batch={args.batch})")
+    print(
+        f"Sending {args.count} spans to {args.endpoint} "
+        f"({args.harm_pct * 100:.0f}% harmful, batch={args.batch})"
+    )
 
     sent = 0
     while sent < args.count:

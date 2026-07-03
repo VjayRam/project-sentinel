@@ -48,9 +48,7 @@ def read_reference_scores(
         ).fetchall()
 
     scores = [r[0] for r in rows]
-    logger.info(
-        "Reference scores loaded | model=%s | n=%d", model_version, len(scores)
-    )
+    logger.info("Reference scores loaded | model=%s | n=%d", model_version, len(scores))
     return scores
 
 

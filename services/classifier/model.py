@@ -50,9 +50,7 @@ def _resolve_model_dir() -> tuple[Path, str, str | None]:
     # Parse each report.json exactly once — sort the (report, path) pairs
     # themselves rather than re-parsing the winner after sorting by a lambda
     # key that already parsed every file once.
-    reports = [
-        (json.loads(p.read_text()), p) for p in log_root.glob("*/report.json")
-    ]
+    reports = [(json.loads(p.read_text()), p) for p in log_root.glob("*/report.json")]
     reports.sort(key=lambda item: item[0].get("completed_at", ""), reverse=True)
     if not reports:
         raise RuntimeError("No completed optimization runs found in logs/optimizer/")

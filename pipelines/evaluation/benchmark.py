@@ -157,9 +157,13 @@ def run(model_dir: str, threshold: float = 0.5, sample_size: int | None = None) 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Benchmark a candidate model against the held-out set")
-    p.add_argument("--model-dir", required=True, help="Directory with the .onnx model + tokenizer files")
+    p.add_argument(
+        "--model-dir", required=True, help="Directory with the .onnx model + tokenizer files"
+    )
     p.add_argument("--threshold", type=float, default=0.5)
-    p.add_argument("--sample-size", type=int, default=None, help="Subsample the holdout set for a quick run")
+    p.add_argument(
+        "--sample-size", type=int, default=None, help="Subsample the holdout set for a quick run"
+    )
     p.add_argument("--output", default=None, help="Path to write the report as JSON")
     return p.parse_args()
 
