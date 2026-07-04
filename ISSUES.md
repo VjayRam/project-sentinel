@@ -1,8 +1,8 @@
 # Production Gaps
 
-Issues found during audit of the classifier service and infra stack against real large-scale production patterns. Ordered by impact — items near the top would block a real deployment; items near the bottom are best practices that catch up with you over time.
+Issues found during an early audit of the classifier service and infra stack against real large-scale production patterns — written when only Phases 1–4 existed. Ordered by impact — items near the top would block a real deployment; items near the bottom are best practices that catch up with you over time.
 
-Each item has: what's wrong, what the fix looks like, and why it matters.
+Each item has: what's wrong, what the fix looks like, and why it matters. **Re-verified against the codebase after Phases 5–7 landed** (stream processing, drift detection, orchestration, MLflow, manual labelling, automated retraining) — most items from the original audit are now resolved; each has a status note added rather than being deleted, since the original reasoning is still useful context. One new item (#14) was added from a gap found during that Phase 7 work's own code review.
 
 ---
 
@@ -186,6 +186,8 @@ Without tests:
 
 ## 4. No liveness / readiness probe split
 
+**Status: ✓ Resolved** — `services/classifier/main.py` now has separate `/health/live` and `/health/ready` routes, and a module-level `_ready` flag set `True` only after `lifespan()`'s warmup completes and `False` again during shutdown — exactly the shape proposed below. `infra/terraform/local/main.tf`'s classifier Deployment wires `livenessProbe`/`readinessProbe` to the two paths.
+
 **File:** `services/classifier/main.py`
 **Severity:** Causes operational incidents in K8s
 
@@ -310,6 +312,8 @@ When a production incident happens at 2am, the first thing you do is search logs
 
 ## 6. No centralized config (`BaseSettings`)
 
+**Status: ✓ Resolved** — `services/classifier/config.py` exists with a `pydantic_settings.BaseSettings` subclass covering every env var this service reads (`database_url`, `classify_threshold`, `ort_intra_threads`, `max_batch_size`, `max_wait_ms`, `max_queue_depth`, MinIO settings, etc.), imported as `from config import settings` everywhere else in the service — the exact shape proposed below.
+
 **Files:** `services/classifier/model.py`, `services/classifier/batcher.py`
 **Severity:** Operational and maintenance burden
 
@@ -360,6 +364,8 @@ In production, config errors are a top cause of deployment failures. With `BaseS
 
 ## 7. Unbounded asyncio queue in the batcher
 
+**Status: ✓ Resolved** — `batcher.py`'s queue is constructed with `asyncio.Queue(maxsize=settings.max_queue_depth)`, and `submit()` catches `asyncio.QueueFull` and turns it into an HTTP 503 — the exact shape proposed below (down to the config-driven max size).
+
 **File:** `services/classifier/batcher.py`
 **Severity:** Causes OOM crashes under load spikes
 
@@ -406,6 +412,8 @@ An unbounded queue under load means: latency climbs first (requests wait longer)
 
 ## 8. `CLASSIFY_THRESHOLD` baked in at module import time
 
+**Status: Half-resolved — the schema exists, but the value is still discarded.** `model_registry.threshold` is a real column now (`infra/terraform/local/main.tf`'s schema), `services/classifier/db.py`'s `get_active_model()` selects it into the `active` dict, and `register_model()` writes it back on self-registration. But `main.py`'s `lifespan()` never passes `active["threshold"]` into `Classifier(...)` — `Classifier.__init__` unconditionally sets `self.threshold = settings.classify_threshold` (the env var), so the DB-sourced value is fetched and then silently thrown away. The original problem (threshold and model version can drift apart across a promotion) is still real. Fix: thread `active["threshold"]` through to `Classifier.__init__` as an optional override, falling back to `settings.classify_threshold` only when there's no active registry row (matching how `model_dir` already falls back the same way in the same function).
+
 **File:** `services/classifier/model.py`
 **Severity:** Operational inflexibility
 
@@ -435,6 +443,8 @@ When a new model version has a different decision boundary (fine-tuned on harder
 ---
 
 ## 9. Empty evaluation pipeline
+
+**Status: ✓ Resolved** — both files are fully implemented (`benchmark.py`: scores the held-out set in `datasets/test_dataset.csv`, reports accuracy/precision/recall/F1/AUC-ROC and `peak_memory_mb`; `validate.py`: gates on an absolute `MIN_ACCURACY` floor plus a `MAX_ACCURACY_DROP`-vs-baseline regression check). Wired into both the manual optimizer flow and `pipelines/retraining/pipeline.py`'s automated retrain flow — see [`pipelines/evaluation/explanation.md`](pipelines/evaluation/explanation.md).
 
 **Files:** `pipelines/evaluation/benchmark.py`, `pipelines/evaluation/validate.py`
 **Severity:** No automated quality gate before model promotion
@@ -472,6 +482,8 @@ Phase 7 (Airflow DAG) will automate retraining and promotion. Without an evaluat
 
 ## 10. `conftest.py` mock is inconsistent with the real API
 
+**Status: ✓ Resolved, differently than proposed** — `tests/conftest.py` was removed entirely rather than fixed in place. `tests/test_classifier_api.py` now patches `main.Classifier` inline with a `MagicMock` whose `predict.side_effect` correctly returns `{"label": "safe"/"harm", "score": float}` for a `list[str]` input — the same contract-correctness this issue asked for, just without a shared fixture file.
+
 **File:** `tests/conftest.py`
 **Severity:** Tests give false confidence
 
@@ -508,6 +520,8 @@ A mock that doesn't match the real interface lets tests pass while hiding bugs. 
 ---
 
 ## 11. Prometheus scrape target is not K8s-native (deferred to Phase 5)
+
+**Status: Resolved, differently than proposed.** The classifier now runs entirely in-cluster (Phase 5 completed), and `infra/prometheus/prometheus.yml`'s target is `classifier.sentinel-app.svc.cluster.local:8000` — the in-cluster Service DNS name, not `host.k3d.internal`. Service DNS transparently load-balances across however many pods currently back that Service, so this does scale past a single instance, unlike the original workaround. It's not the `kubernetes_sd_configs` pod-level service-discovery this issue originally proposed (no per-pod labels/relabeling), so a future multi-replica setup where you want per-pod metrics (not just an aggregate the Service load-balances you to) would still want that. For this project's current scale, Service-DNS scraping is a legitimate, simpler production pattern, not just a stopgap.
 
 **File:** `infra/prometheus/prometheus.yml`
 **Severity:** Does not scale past a single local instance
@@ -593,6 +607,8 @@ Dependency isolation between services and pipelines is not organizational prefer
 
 ## 13. Retraining on `flagged_content` alone causes class imbalance
 
+**Status: Half-resolved, with a different second mitigation than proposed.** Fix 1 (asymmetric safe-content sampling) is implemented exactly as described: `services/stream-processor/writer.py` stores 100% of `harm` and a `SAFE_SAMPLE_RATE`-fraction (default 0.1) of `safe` content. Fix 2 (auto-mixing with an original balanced dataset in the retrain pipeline) was **not** implemented as proposed — `pipelines/retraining/dataset.py`'s `build_dataset()` deliberately never uses `datasets/test_dataset.csv` as that "original dataset," since that CSV is the evaluation pipeline's held-out set; mixing it into training would contaminate the accuracy numbers the quality gate (#9, now resolved) relies on. An `--initial-dataset-path` hook exists for a *different* balanced CSV if one is ever added, but none ships with the repo, so today's retrains train purely on accepted `flagged_content`. The actual mitigation in place instead is Phase 7's manual-labelling step (`services/label-ui`): a human reviews and explicitly accepts/rejects each candidate before it becomes training data, which catches a badly-skewed batch that pure automatic mixing wouldn't — but unlike automatic mixing, this depends on an operator actually paying attention to the ratio, and nothing currently blocks or warns on submitting a fine-tune run whose accepted set is heavily skewed toward one label. The failure mode this issue describes (a retrain that collapses toward predicting one class) is exactly what the quality gate's accuracy floor is designed to catch after the fact — but nothing warns *before* training that the input is skewed.
+
 **Files:** `pipelines/retrain/` (Phase 7), stream processor (Phase 5)
 **Severity:** Model quality — silent accuracy collapse after first retrain
 
@@ -645,6 +661,35 @@ The first retrain after accumulating enough harmful examples will silently destr
 
 ---
 
+## 14. `drift_dag.py` can't distinguish a pipeline crash from a benign "nothing to report"
+
+**File:** `orchestration/drift_dag.py`, `pipelines/drift/drift_job.py`
+**Severity:** Silent monitoring gap — a real outage produces no alert
+**Found:** during code review of the Phase 7 automated-retraining PR
+
+### What's wrong
+
+`drift_job.py` deliberately exits `0` for two very different situations: "ran cleanly, found no drift" and "skipped — not enough reference data yet, or no rows in the current window" (see `MIN_REFERENCE_SIZE`). It exits `1` for a genuine configuration/DB error, and `2` when drift **is** detected — but at the Kubernetes/`spark-operator` layer, both `1` and `2` surface identically as `applicationState.state == "FAILED"`; there's no way to tell "drift was found" apart from "the job crashed" from that field alone.
+
+`drift_dag.py`'s `check_drift` task works around the *drift-vs-crash* half of this ambiguity correctly by reading `drift_stats` directly instead of trusting the K8s-level status (`drift_job.py` always writes its row before calling `sys.exit()`, so Postgres is the real source of truth). But it has no way to work around the other half: a stale-or-missing `drift_stats` row means either "genuinely nothing new to report" (benign) or "the job crashed before writing anything" (a real outage) — both look identical to `check_drift`, and both correctly fall back to `no_drift_detected` (the safe choice — never retrain on an ambiguous signal). The cost of that safety is observability: a real, ongoing failure in the drift pipeline (bad `DATABASE_URL` after a credential rotation, a Spark driver OOM, a regression in `drift_job.py` itself) currently produces the exact same "quiet, uneventful hourly run" as everything working perfectly with nothing to report. Nothing pages anyone.
+
+### What the fix looks like
+
+The distinction needs to live in `drift_stats` itself, not be inferred from its absence. Add an explicit status column:
+
+```sql
+ALTER TABLE drift_stats ADD COLUMN status VARCHAR(10) NOT NULL DEFAULT 'ok'
+    CHECK (status IN ('ok', 'skipped', 'error'));
+```
+
+`drift_job.py` writes a row in **all three** cases instead of only the two it does today — `'ok'` for a completed comparison (drift found or not, `drift_flagged` already captures which), `'skipped'` for the `MIN_REFERENCE_SIZE`/empty-window guards, and `'error'` for a caught exception right before re-raising (a `try/except` around the body of `main()`, writing the row, then exiting 1 as it already does). `check_drift` then reads `status` directly instead of inferring it from row freshness: `'error'` becomes a real Airflow task failure (visible in the DAG's own success/failure history, alertable via Airflow's own failure notifications), `'skipped'`/`'ok'`-with-`drift_flagged=false` both correctly still mean `no_drift_detected`.
+
+### Why it matters
+
+Silent monitoring gaps are worse than loud failures — a broken drift pipeline that "looks fine" for weeks means no one notices until someone asks "wait, why hasn't this model been retrained in 3 months?" and discovers the automation quietly stopped working. This is exactly the kind of gap that's cheap to close while building the feature and expensive to discover later.
+
+---
+
 ## Status tracker
 
 Work through these in order — each one unblocks the next.
@@ -654,13 +699,16 @@ Work through these in order — each one unblocks the next.
 | 1 | Dockerfile for classifier | P0 — CD is broken | ✓ done |
 | 2 | Remove `torch`/`optimum` from classifier deps | P0 — image size | ✓ done |
 | 3 | Tests for classifier service | P0 — no safety net | ✓ done |
-| 4 | Liveness / readiness probe split | P1 — K8s stability | open |
+| 4 | Liveness / readiness probe split | P1 — K8s stability | ✓ done |
 | 5 | Structured JSON logging | P1 — production observability | open |
-| 6 | Centralized config (`BaseSettings`) | P1 — operational safety | open |
-| 7 | Bounded queue with backpressure in batcher | P1 — OOM risk | open |
-| 8 | Threshold from model registry, not env var | P2 — model/config coupling | open |
-| 9 | Implement evaluation pipeline | P2 — no quality gate | open |
-| 10 | Fix `conftest.py` mock contract | P2 — false test confidence | ✓ done |
-| 11 | K8s-native Prometheus scrape (deferred to Phase 5) | P3 — deferred until classifier is in cluster | open |
+| 6 | Centralized config (`BaseSettings`) | P1 — operational safety | ✓ done |
+| 7 | Bounded queue with backpressure in batcher | P1 — OOM risk | ✓ done |
+| 8 | Threshold from model registry, not env var | P2 — model/config coupling | half-done — see #8 |
+| 9 | Implement evaluation pipeline | P2 — no quality gate | ✓ done |
+| 10 | Fix `conftest.py` mock contract | P2 — false test confidence | ✓ done (differently — see #10) |
+| 11 | K8s-native Prometheus scrape (deferred to Phase 5) | P3 — deferred until classifier is in cluster | ✓ done (differently — see #11) |
 | 12 | `pyproject.toml` for optimizer pipeline | P2 — dependency isolation | ✓ done |
-| 13 | Class imbalance in retrain dataset | P1 — model collapses after first retrain | open |
+| 13 | Class imbalance in retrain dataset | P1 — model collapses after first retrain | half-done — see #13 |
+| 14 | `drift_dag.py` can't distinguish a crash from "nothing to report" | P2 — silent monitoring gap | open |
+
+**Genuinely still open:** #5 (JSON logging), #8 (threshold override wiring), #14 (drift status column). **Open, differently scoped than described:** #13 (an operator now curates the data, but nothing warns on a skewed accepted-label batch before training).
