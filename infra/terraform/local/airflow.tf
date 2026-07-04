@@ -216,9 +216,9 @@ resource "kubernetes_secret" "retraining_minio" {
 }
 
 resource "helm_release" "airflow" {
-  name             = "airflow"
-  repository       = "https://airflow.apache.org"
-  chart            = "airflow"
+  name       = "airflow"
+  repository = "https://airflow.apache.org"
+  chart      = "airflow"
   # Pinned to an exact version, not a "~>" constraint — the Helm provider
   # resolves constraints to a concrete version during apply, which produced
   # a "Provider produced inconsistent final plan" error (a known provider
@@ -260,8 +260,8 @@ resource "helm_release" "airflow" {
     # (non-subchart) postgresql, so it's set explicitly rather than trusting
     # the chart default.
     migrateDatabaseJob = {
-      enabled       = true
-      useHelmHooks  = false
+      enabled      = true
+      useHelmHooks = false
     }
 
     postgresql = { enabled = false }

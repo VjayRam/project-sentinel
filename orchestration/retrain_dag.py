@@ -82,7 +82,9 @@ def _rollout_restart(**context) -> None:
 
     for deployment in ("classifier", "stream-processor"):
         patch = {
-            "spec": {"template": {"metadata": {"annotations": {"sentinel/restartedAt": restarted_at}}}}
+            "spec": {
+                "template": {"metadata": {"annotations": {"sentinel/restartedAt": restarted_at}}}
+            }
         }
         apps_v1.patch_namespaced_deployment(name=deployment, namespace=APP_NAMESPACE, body=patch)
         logger.info("Restarted deployment/%s", deployment)
@@ -109,7 +111,9 @@ with DAG(
             k8s.V1EnvVar(
                 name="DATABASE_URL",
                 value_from=k8s.V1EnvVarSource(
-                    secret_key_ref=k8s.V1SecretKeySelector(name="drift-postgres", key="database-url")
+                    secret_key_ref=k8s.V1SecretKeySelector(
+                        name="drift-postgres", key="database-url"
+                    )
                 ),
             ),
             k8s.V1EnvVar(
@@ -131,7 +135,9 @@ with DAG(
             k8s.V1EnvVar(
                 name="MINIO_SECRET_KEY",
                 value_from=k8s.V1EnvVarSource(
-                    secret_key_ref=k8s.V1SecretKeySelector(name="retraining-minio", key="root-password")
+                    secret_key_ref=k8s.V1SecretKeySelector(
+                        name="retraining-minio", key="root-password"
+                    )
                 ),
             ),
             k8s.V1EnvVar(
