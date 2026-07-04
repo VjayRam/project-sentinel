@@ -77,6 +77,8 @@ no production credentials are hardcoded.
 | `prometheus_storage_size` | `5Gi` | PVC size for Prometheus TSDB |
 | `grafana_admin_password` | `admin` | Grafana admin login |
 | `kafka_storage_size` | `2Gi` | PVC size for Kafka topic data |
+| `airflow_admin_password` | `sentinel` | Airflow webserver admin login |
+| `airflow_webserver_secret_key` | (dev-only static string) | Flask session-signing key — see the Airflow section's gotcha #7 for why this must not be left unset |
 
 **To override without editing the file**, use `-var`:
 ```bash
@@ -386,9 +388,16 @@ Acceptable for local dev on a private network; never disable in production.
 
 ### Kafka
 
+Uses the **official `apache/kafka` image**, not Bitnami — so env vars are the
+bare `KAFKA_*` names (`KAFKA_PROCESS_ROLES`, `KAFKA_LISTENERS`, etc.), *not*
+Bitnami's `KAFKA_CFG_*`-prefixed convention. Easy to mix up if you've worked
+with the Bitnami chart before; the two images silently ignore each other's env
+var names instead of erroring, so a `KAFKA_CFG_X` var on this image just does
+nothing.
+
 ```hcl
-env { name = "KAFKA_CFG_PROCESS_ROLES";    value = "broker,controller" }
-env { name = "KAFKA_CFG_CONTROLLER_QUORUM_VOTERS"; value = "1@localhost:9093" }
+env { name = "KAFKA_PROCESS_ROLES";    value = "broker,controller" }
+env { name = "KAFKA_CONTROLLER_QUORUM_VOTERS"; value = "1@localhost:9093" }
 ```
 
 **KRaft mode** (no ZooKeeper) — Kafka 3.3+ includes KRaft as production-stable.
@@ -400,9 +409,9 @@ voter because the controller and broker are in the same pod.
 **Two listeners:**
 
 ```hcl
-env { name = "KAFKA_CFG_LISTENERS";
+env { name = "KAFKA_LISTENERS";
       value = "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094" }
-env { name = "KAFKA_CFG_ADVERTISED_LISTENERS";
+env { name = "KAFKA_ADVERTISED_LISTENERS";
       value = "PLAINTEXT://kafka.sentinel-data.svc.cluster.local:9092,EXTERNAL://localhost:9094" }
 ```
 
@@ -421,7 +430,7 @@ env { name = "KAFKA_CFG_ADVERTISED_LISTENERS";
 what Kafka tells clients to use after the initial metadata fetch. If this is
 wrong, clients can connect initially but fail when they try to produce/consume.
 
-**`KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1`** — the `__consumer_offsets`
+**`KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1`** — the `__consumer_offsets`
 internal topic defaults to a replication factor of 3. With only one broker, 3
 replicas are impossible and Kafka would never create the topic, leaving consumers
 unable to commit offsets. Setting it to 1 makes single-broker operation possible.
@@ -450,6 +459,58 @@ service with at most 3 meaningful replicas.
 kubectl exec -n sentinel-data statefulset/kafka -- \
   kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic traces.raw
 ```
+
+---
+
+### Gotcha: PVC mounted, but Kafka wasn't writing to it
+
+The `data` volume has always been mounted at `/bitnami/kafka` (a path name
+left over from when Bitnami's image was being evaluated), but for a long time
+nothing told Kafka to actually put its KRaft log segments there. The official
+`apache/kafka` image's default `log.dirs` is `/tmp/kraft-combined-logs` — a
+path that has nothing to do with the mounted PVC. Every pod restart was
+silently wiping all topic data, because the "persistent" volume was never
+where Kafka actually wrote.
+
+**Fix:** set `KAFKA_LOG_DIRS` explicitly to a path under the mount:
+
+```hcl
+env {
+  name  = "KAFKA_LOG_DIRS"
+  value = "/bitnami/kafka/data"
+}
+```
+
+**How this was caught:** not by reading the image's docs — by restarting the
+`kafka-0` pod live and comparing `kafka-consumer-groups.sh --describe` output
+(topic offsets, consumer group lag) before and after. Identical output after
+a restart is the actual proof persistence works; a green `kubectl get pods`
+proves nothing about whether the *data* survived.
+
+### Gotcha: pinning the image version can be a silent downgrade
+
+Following the general "never `:latest`, always pin" rule, `apache/kafka:latest`
+got pinned to `apache/kafka:3.9.0` — a specific, well-tested version. This
+immediately crash-looped every broker start with:
+
+```
+java.lang.IllegalArgumentException: No MetadataVersion with feature level 30
+```
+
+Root cause: `:latest` had already drifted to Kafka 4.3.1 by the time this PVC
+was first formatted (confirmed by inspecting the cached image's jar filename:
+`kafka_2.13-4.3.1.jar`), and KRaft's on-disk metadata format is
+**forward-compatible only** — an older broker cannot read metadata a newer
+one wrote. `3.9.0` is *older* than whatever had been running, so pinning to it
+was a downgrade, not a stability improvement.
+
+**The fix isn't "always pin to the newest stable release"** — it's "pin to
+whatever version is actually compatible with data already on disk, or wipe
+the PVC first." For a fresh cluster with no existing data, pinning to 3.9.0
+would have been fine. For this one, the right pin was 4.3.1 (matching what
+had already formatted the volume). **If you ever bump this version going
+forward, wipe the PVC first** (`kubectl delete pvc data-kafka-0 -n sentinel-data`)
+unless you've confirmed the new version can read the old metadata format.
 
 ---
 
@@ -582,6 +643,388 @@ every span as it arrives. Remove `debug` before committing.
 
 ---
 
+### spark-operator (sentinel-pipeline)
+
+```hcl
+resource "helm_release" "spark_operator" {
+  repository = "https://kubeflow.github.io/spark-operator"
+  chart      = "spark-operator"
+  version    = "~2.1"
+  namespace  = kubernetes_namespace.sentinel["sentinel-pipeline"].metadata[0].name
+  values = [yamlencode({
+    controller = { workers = 1 }
+    webhook    = { enable = true }
+    spark      = { jobNamespaces = ["sentinel-pipeline"] }
+  })]
+}
+```
+
+The operator itself doesn't run Spark jobs — it watches for `SparkApplication`
+custom resources (defined in `pipelines/drift/spark-application.yaml`) and
+translates each one into a driver pod + N executor pods, using its own
+`spark` ServiceAccount to create/delete them. `spark.jobNamespaces` scopes
+which namespaces it's allowed to watch — restricting it to `sentinel-pipeline`
+means a `SparkApplication` submitted anywhere else is simply ignored, not an
+error.
+
+**RBAC**: the driver pod runs as its own `kubernetes_service_account.spark`,
+bound to a `kubernetes_role.spark_driver` with `create/get/list/watch/delete/
+deletecollection/update/patch` on `pods/services/configmaps/
+persistentvolumeclaims`. The driver needs to create and later clean up its
+own executor pods — `deletecollection` specifically is required for the
+operator's cleanup step; without it, completed/failed SparkApplications leave
+orphaned executor pods behind (`Forbidden` errors in the operator's logs are
+the tell).
+
+See [`../../pipelines/drift/explanation.md`](../../pipelines/drift/explanation.md)
+for what actually runs inside the driver/executor pods.
+
+---
+
+### Airflow (sentinel-pipeline, `airflow.tf`)
+
+Deployed via the official Apache Airflow Helm chart with `LocalExecutor` —
+tasks run as subprocesses of the scheduler pod, so there's no Celery/Redis/
+Flower to operate at this scale. Reuses the existing PostgreSQL instance (a
+separate `airflow` database) instead of the chart's bundled Postgres subchart.
+
+```hcl
+resource "helm_release" "airflow" {
+  chart   = "airflow"
+  version = "1.15.0"   # exact version, not "~> 1.15" — see gotcha below
+  values  = [yamlencode({
+    executor   = "LocalExecutor"
+    redis      = { enabled = false }
+    flower     = { enabled = false }
+    statsd     = { enabled = false }
+    triggerer  = { enabled = false }
+    postgresql = { enabled = false }
+    migrateDatabaseJob = { enabled = true, useHelmHooks = false }
+    data = { metadataConnection = { host = "postgresql.sentinel-data.svc.cluster.local", db = "airflow", ... } }
+    scheduler = { extraVolumes = [...], extraVolumeMounts = local.dag_volume_mounts }
+    webserver = { extraVolumes = [...], extraVolumeMounts = local.dag_volume_mounts }
+  })]
+}
+```
+
+DAGs are mounted from a `kubernetes_config_map` built by reading every file
+in `orchestration/*.py` (same `file()`-and-embed pattern used for Prometheus
+config and the Postgres init scripts above) — no git-sync sidecar, no custom
+image to rebuild every time a DAG changes.
+
+This deployment surfaced more live-only gotchas than anything else in this
+repo. In the order they were actually hit:
+
+**1. `airflow` database has to exist before the chart's migration Job can
+run.** The Postgres init SQL that creates it (`CREATE DATABASE airflow OWNER
+sentinel;`, in `main.tf`'s `postgres_init` ConfigMap) only executes on a
+*fresh* Postgres data directory — it does nothing on a cluster whose Postgres
+already has data. On an existing cluster, create it manually once:
+```bash
+echo "CREATE DATABASE airflow OWNER sentinel;" | \
+  kubectl exec -i -n sentinel-data postgresql-0 -- psql -U sentinel -d sentinel
+```
+
+**2. `migrateDatabaseJob.enabled` needs to be explicit.** Without it, the
+scheduler/webserver's `wait-for-airflow-migrations` init container
+crash-loops forever — no migration Job ever gets created to satisfy it. The
+chart's default didn't reliably create the Job when using an external
+(non-subchart) Postgres. Set it explicitly:
+```hcl
+migrateDatabaseJob = { enabled = true, useHelmHooks = false }
+```
+
+**3. `extraVolumes`/`extraVolumeMounts` are per-component, not top-level.**
+Setting them at the top level of the values object is accepted by YAML/Helm
+with *no error at all* — it's just silently ignored, because this chart
+scopes those keys under `scheduler.*`, `webserver.*`, `workers.*`, etc., not
+globally. The tell: `/opt/airflow/dags` exists but is empty on every pod, no
+matter how correct the ConfigMap itself looks. Nest under the specific
+component:
+```hcl
+scheduler = { extraVolumes = [...], extraVolumeMounts = [...] }
+webserver = { extraVolumes = [...], extraVolumeMounts = [...] }
+```
+
+**4. A ConfigMap mounted as a directory breaks Airflow's DAG file walker.**
+Even correctly mounted, `airflow dags list` failed with:
+```
+RuntimeError: Detected recursive loop when walking DAG directory /opt/airflow/dags:
+/opt/airflow/dags/..2026_07_03_05_03_34.641811799 has appeared more than once.
+```
+Kubernetes mounts ConfigMap volumes through a `..data -> ..<timestamp>`
+symlink indirection so updates are atomic. Airflow's DAG-directory walker
+(`find_path_from_directory`) doesn't understand that structure and aborts.
+**Fix:** mount each DAG file individually via `subPath` instead of mounting
+the ConfigMap as a whole directory — `subPath` mounts bypass the symlink
+indirection entirely and appear as plain files:
+```hcl
+locals {
+  dag_volume_mounts = [
+    for f in fileset("${path.module}/../../../orchestration", "*.py") : {
+      name = "dags", mountPath = "/opt/airflow/dags/${f}", subPath = f, readOnly = true
+    }
+  ]
+}
+```
+One `volumeMount` per DAG file — more entries as `orchestration/` grows, but
+generated dynamically from the same `fileset()` the ConfigMap's `data` uses,
+so it never needs manual updates.
+
+**5. `"~> 1.15"` version constraints can break `helm_release` imports.** Using
+a loose constraint produced `Error: Provider produced inconsistent final
+plan... was cty.StringVal("~> 1.15"), but now cty.StringVal("1.15.0")` — a
+known Helm-provider quirk where the constraint resolves to a concrete version
+mid-apply. Pin the exact version instead; it also matches the "never
+`:latest`" spirit anyway.
+
+**6. An interrupted `terraform apply` can leave a healthy release stuck in
+`pending-install`.** If the apply is killed after Helm's `helm install` has
+already started server-side, the underlying pods can come up completely
+healthy while Helm's own bookkeeping (a `sh.helm.release.v1.<name>.v1`
+Secret) never gets marked `deployed`. Symptom: `helm list` shows
+`pending-install` and any new `helm upgrade`/`terraform apply` fails with
+`cannot re-use a name that is still in use`. **Don't reflexively
+uninstall+reinstall** — that destroys working pods for no reason. Instead,
+patch the release Secret's stored status directly:
+```bash
+# decode .data.release (double base64 + gzip), fix info.status to "deployed",
+# re-encode, kubectl patch the secret, then:
+terraform import helm_release.airflow "sentinel-pipeline/airflow"
+```
+
+**7. `webserverSecretKeySecretName` needs to be set explicitly, or you get a
+warning banner and unstable sessions.** Without either `webserverSecretKey`
+or `webserverSecretKeySecretName`, the chart auto-generates a random Flask
+secret key **on every deploy** — every `terraform apply` that touches the
+release invalidates all webserver sessions, and Airflow shows a persistent
+"Usage of a dynamic webserver secret key detected" dashboard warning. Fix:
+create your own Secret and point the chart at it:
+```hcl
+resource "kubernetes_secret" "airflow_webserver_secret_key" {
+  metadata { name = "airflow-webserver-secret-key-static" }  # NOT the chart's
+                                                                # own default name
+                                                                # (already taken
+                                                                # by its auto-
+                                                                # generated one)
+  data = { webserver-secret-key = var.airflow_webserver_secret_key }
+}
+# then: webserverSecretKeySecretName = kubernetes_secret.airflow_webserver_secret_key.metadata[0].name
+```
+Verify it's actually static by deleting the webserver pod and diffing the
+Secret's value before/after — it should be byte-for-byte identical.
+
+**8. Port 8080 is not actually free in a k3d cluster.** The Airflow webserver
+listens on 8080 inside the pod, so the obvious port-forward is
+`8080:8080` — but k3d's own `<cluster>-serverlb` container already publishes
+host port 8080 for its own ingress (`0.0.0.0:8080->80/tcp`), invisible to
+`lsof`/`fuser` because it's a Docker-managed listener, not a process in this
+shell's namespace. `kubectl port-forward` silently loses that race. Forward
+to a different **local** port instead — the remote/pod side stays 8080:
+```bash
+kubectl port-forward -n sentinel-pipeline svc/airflow-webserver 8090:8080
+```
+
+**Tip — the fastest way to check "did my DAG actually load":**
+```bash
+kubectl exec -n sentinel-pipeline airflow-scheduler-0 -c scheduler -- \
+  airflow dags list-import-errors     # "No data found" == clean
+kubectl exec -n sentinel-pipeline airflow-scheduler-0 -c scheduler -- \
+  airflow dags trigger healthcheck && sleep 15 && \
+kubectl exec -n sentinel-pipeline airflow-scheduler-0 -c scheduler -- \
+  airflow dags list-runs -d healthcheck
+```
+
+**9. Editing a DAG file and re-applying Terraform updates the ConfigMap, but
+not the mounted file — a direct consequence of gotcha #4's own fix.**
+Mounting each DAG via `subPath` (to dodge the DAG-walker's recursive-loop
+bug) means bypassing the `..data -> ..<timestamp>` symlink Kubernetes
+normally uses to make ConfigMap updates appear live with no pod restart.
+Trading away the symlink to fix the walker also trades away the live-update
+behavior — confirmed live by editing `orchestration/retrain_dag.py`,
+running `terraform apply`, and `grep`-ing the file's content inside the
+scheduler pod to find it unchanged. **Any DAG file edit needs an explicit
+restart of both pods that mount it:**
+```bash
+kubectl rollout restart statefulset/airflow-scheduler -n sentinel-pipeline
+kubectl rollout restart deployment/airflow-webserver -n sentinel-pipeline
+```
+
+**10. The stable REST API needs its own auth backend enabled — the
+webserver UI login working doesn't imply the API accepts the same
+credentials.** `services/label-ui` triggers `retrain_dag` via `POST
+/api/v1/dags/retrain_dag/dagRuns` using HTTP Basic auth with the same
+admin/`<password>` the UI login form uses — but the REST API validates
+requests against `[api] auth_backends`, a separate config surface from the
+webserver's own session-based login. Without setting it explicitly, that
+first API call failed even though the UI login worked fine. Fixed with an
+explicit `config` block in the Helm values (matching this file's established
+"don't trust chart defaults silently" pattern — see gotcha #2):
+```hcl
+config = {
+  api = { auth_backends = "airflow.api.auth.backend.basic_auth" }
+}
+```
+
+**11. `KubernetesPodOperator` needs its own RBAC — separate from the
+rollout-restart Role.** `retrain_dag.py`'s `run_retraining` task launches a
+pod (`sentinel-retraining:local`) to do the actual fine-tuning — this needs
+permission to `create`/`get`/`list`/`watch`/`delete` `pods` (+ `get`/`list`
+on `pods/log`) in `sentinel-pipeline`, which is a *different* permission
+from `kubernetes_role.airflow_rollout`'s `apps/deployments` patch access in
+`sentinel-app`. Added as a second Role/RoleBinding pair
+(`airflow_pod_launcher`) bound to the same `airflow` ServiceAccount — same
+shape as `spark_driver`'s Role, just for a different SA:
+```hcl
+resource "kubernetes_role" "airflow_pod_launcher" {
+  rule { api_groups = [""]; resources = ["pods"];     verbs = ["create","get","list","watch","delete"] }
+  rule { api_groups = [""]; resources = ["pods/log"]; verbs = ["get","list"] }
+}
+```
+
+**12. A third RBAC surface: custom resources are their own API group,
+separate from core-API pods.** `drift_dag.py` (Phase 7.4) submits/polls/
+deletes a `SparkApplication` — a custom resource in the
+`sparkoperator.k8s.io` group, not the core `""` group `airflow_pod_launcher`
+above covers. Needed its own Role:
+```hcl
+resource "kubernetes_role" "airflow_spark_application" {
+  rule {
+    api_groups = ["sparkoperator.k8s.io"]
+    resources  = ["sparkapplications", "sparkapplications/status"]
+    verbs      = ["create", "get", "list", "watch", "delete"]
+  }
+}
+```
+This is unrelated to `spark_driver`'s Role (`main.tf`) — that one lets the
+**driver pod** manage its own executor pods once spark-operator's
+controller has already created it from the CR; this one lets the
+**Airflow SA** create/watch/delete the CR in the first place.
+
+**13. `scheduler.env` needs `DATABASE_URL` explicitly — the scheduler pod
+has no way to reach the "sentinel" database otherwise.** `data.
+metadataConnection` above configures Airflow's connection to *its own*
+metadata database (named `airflow`) — a completely separate database on
+the same Postgres instance from `model_registry`/`drift_stats`/
+`classifications` (the `sentinel` database). Both `retrain_dag.py`'s
+`decide_promotion` and `drift_dag.py`'s `check_drift` read
+`os.environ["DATABASE_URL"]` directly to reach the latter. This was a
+**latent bug for a while**: `decide_promotion` was written and deployed
+without this env var ever being set, and it went unnoticed because the
+first test run raised its own `ValueError` (quality gate failed) *before*
+ever reaching the `psycopg2.connect(os.environ["DATABASE_URL"])` line —
+the missing env var only became visible once a run actually needed to read
+it. A reminder that a code path "working" in one test doesn't mean every
+line in it executed. Fixed by adding it to the scheduler's `env`, reusing
+the same `drift-postgres` secret already mirrored into this namespace for
+the drift job's driver pod — one secret, three consumers (the driver pod,
+`decide_promotion`, `check_drift`), no duplication.
+
+**14. A Connection was added, then removed, once the approach it supported
+was abandoned.** An earlier version of `drift_dag.py` used
+`apache-airflow-providers-cncf-kubernetes`'s `SparkKubernetesOperator`/
+`SparkKubernetesSensor`, which go through Airflow's own `KubernetesHook`
+and need a real `Connection` object (not just "happens to be running
+in-cluster") — added via `AIRFLOW_CONN_KUBERNETES_DEFAULT` as a JSON env
+var (`jsonencode({conn_type = "kubernetes", extra = {in_cluster = true}})`
+— JSON has worked directly in `AIRFLOW_CONN_*` since Airflow 2.3, sidestepping
+the fragile provider-specific URI-extra-field encoding). That whole
+approach was later abandoned (see
+[`../../orchestration/explanation.md`](../../orchestration/explanation.md)'s
+`drift_dag.py` section for why) in favor of plain
+`kubernetes.config.load_incluster_config()` calls, which need no Airflow
+Connection at all — so this env var was removed again once nothing
+referenced it. Worth knowing if you ever see a stray `AIRFLOW_CONN_*` var
+that looks orphaned: check whether the code that needed it is still there
+before assuming it's still load-bearing.
+
+---
+
+### MLflow (sentinel-monitoring, `mlflow.tf`)
+
+A `kubernetes_deployment`/`kubernetes_service` pair, not a Helm chart — no
+official chart exists for MLflow the way one does for Airflow. Deployment
+(not StatefulSet), same reasoning as Grafana: all real state lives
+elsewhere (Postgres backend store, MinIO artifact store), so the pod itself
+is stateless and freely reschedulable.
+
+```hcl
+args = [
+  "server",
+  "--backend-store-uri", "postgresql://sentinel:$(PG_PASSWORD)@postgresql.../mlflow",
+  "--default-artifact-root", "s3://mlflow/",
+  "--serve-artifacts",
+  "--workers", "2",
+  "--allowed-hosts", join(",", ["localhost", "localhost:5000", "mlflow", ...]),
+]
+```
+
+**Custom image, not the official one directly** (`infra/mlflow/Dockerfile`,
+own explanation.md) — `ghcr.io/mlflow/mlflow` doesn't bundle a Postgres
+driver or S3 client, so `--backend-store-uri postgresql://...` and
+`--default-artifact-root s3://...` both fail to start against the base
+image.
+
+**Reuses existing infra rather than standing up new stateful services** —
+same philosophy as Airflow's separate `airflow` database on the existing
+Postgres instance: a `03_mlflow_db.sql` init script adds an `mlflow`
+database, and the MinIO bucket-init Job gets an `mlflow` bucket alongside
+`models`/`datasets`.
+
+**Three live-only bugs, all found by actually deploying it, not by reading
+docs:**
+
+1. **The `03_mlflow_db.sql` init script never ran** — same class of gotcha
+   as Airflow's #1: Postgres init scripts only execute against a *fresh*
+   data directory, and this cluster's Postgres already had data from
+   earlier phases. Fixed the same way: create the database manually once
+   against the live instance (`CREATE DATABASE mlflow OWNER sentinel;`);
+   the SQL script stays in `main.tf` so a from-scratch cluster still gets
+   it automatically.
+2. **OOMKilled at both 512Mi and 1Gi memory limits.** MLflow's FastAPI/
+   uvicorn tracking server defaults to 4 worker processes — heavier than
+   the single-process Grafana/Jaeger images this resource block was
+   originally copied from. Fixed with `--workers 2` and a `2Gi`/`768Mi`
+   limit/request — the node had ~10Gi free the whole time, this was purely
+   a cgroup limit being too tight, not real memory pressure.
+3. **403 "Invalid Host header — possible DNS rebinding attack detected"**
+   when the retraining pod (a different namespace) connected. MLflow 3.5+
+   ships a security middleware that only allows `localhost` + private IPs
+   by default — an in-cluster DNS name like
+   `mlflow.sentinel-monitoring.svc.cluster.local` isn't recognized.
+   `--allowed-hosts` **replaces** the default rather than extending it, so
+   `localhost` had to be re-added explicitly too, or the port-forwarded
+   UI/browser access would have broken instead. Matching is against the
+   full `Host:port` header, not just the hostname — bare `mlflow` 403'd
+   just like the DNS name did until the `:5000`-suffixed forms were added
+   too.
+
+---
+
+### Label UI (sentinel-app, `label-ui.tf`)
+
+Plain `kubernetes_deployment`/`kubernetes_service`, same shape as
+classifier/stream-processor — no new pattern introduced. The only thing
+worth noting here is credential mirroring: this service needs both the
+`sentinel-app`-local `app_mongodb` secret (already mirrored there for other
+app services) *and* `airflow_admin_password`, which otherwise only exists
+in `sentinel-pipeline` — K8s Secrets are namespace-scoped, so a new
+`app_airflow` secret mirrors that one value into `sentinel-app` too, same
+pattern as `app_mongodb`/`app_minio`.
+
+```hcl
+resource "kubernetes_secret" "app_airflow" {
+  metadata { name = "airflow-credentials"; namespace = "sentinel-app" }
+  data     = { admin-password = var.airflow_admin_password }
+}
+```
+
+See [`../../services/label-ui/explanation.md`](../../services/label-ui/explanation.md)
+for what the service actually does with these credentials (triggering
+`retrain_dag` via Airflow's REST API).
+
+---
+
 ## outputs.tf
 
 All outputs are port-forward commands. Running `terraform output` after `apply`
@@ -598,6 +1041,18 @@ when you want to open individual tunnels manually:
 $(terraform output -raw jaeger_port_forward) &
 $(terraform output -raw otel_collector_grpc_port_forward) &
 ```
+
+**`airflow_webserver_port_forward` forwards local `8090` to the pod's `8080`**
+— the only asymmetric one. `kubectl port-forward <local>:<remote>` supports
+different port numbers on each side; only the local side needed to move here
+(k3d's own load balancer already owns host port 8080), the Service and pod
+both still listen on 8080 internally.
+
+**`mlflow_port_forward` / label-ui's port** — MLflow's UI is at
+`http://localhost:5000` after `kubectl port-forward -n sentinel-monitoring
+svc/mlflow 5000:5000`; the labelling UI is at `http://localhost:8001` via
+`kubectl port-forward -n sentinel-app svc/label-ui 8001:8001`. Both are
+symmetric (same port on both sides) — 5000 and 8001 were simply free.
 
 ---
 

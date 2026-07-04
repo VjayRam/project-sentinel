@@ -106,3 +106,13 @@ output "otel_collector_http_port_forward" {
   description = "Command to send OTLP HTTP traces to the collector from your local machine (:4318)"
   value       = "kubectl port-forward -n sentinel-monitoring svc/otel-collector 4318:4318"
 }
+
+output "airflow_webserver_port_forward" {
+  description = "Command to open the Airflow UI from your local machine (http://localhost:8090, admin/<airflow_admin_password>). Local port 8090, not 8080 — k3d's serverlb container already publishes host port 8080 for its own ingress."
+  value       = "kubectl port-forward -n sentinel-pipeline svc/airflow-webserver 8090:8080"
+}
+
+output "mlflow_port_forward" {
+  description = "Command to open the MLflow UI from your local machine (http://localhost:5000)"
+  value       = "kubectl port-forward -n sentinel-monitoring svc/mlflow 5000:5000"
+}

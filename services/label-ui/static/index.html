@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sentinel — Manual Labelling</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; background: #0e1117; color: #e6e6e6; }
+  h1 { font-size: 1.3rem; }
+  #stats { margin-bottom: 1rem; color: #9aa0a6; }
+  #stats b { color: #e6e6e6; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { border-bottom: 1px solid #2a2f3a; padding: 0.5rem; text-align: left; vertical-align: top; }
+  th { color: #9aa0a6; font-weight: 600; }
+  td.text { max-width: 480px; white-space: pre-wrap; word-break: break-word; }
+  select, button { background: #1a1f2b; color: #e6e6e6; border: 1px solid #2a2f3a; border-radius: 4px; padding: 0.3rem 0.5rem; }
+  button { cursor: pointer; }
+  button:hover { border-color: #4a90e2; }
+  button.accept { border-color: #2e7d32; }
+  button.reject { border-color: #c62828; }
+  button.saved { opacity: 0.4; cursor: default; }
+  .row-saved { opacity: 0.5; }
+  #trigger { margin-top: 1.5rem; padding: 0.6rem 1.2rem; font-size: 1rem; border-color: #4a90e2; }
+  #trigger-status { margin-left: 1rem; color: #9aa0a6; }
+  .badge { display: inline-block; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.75rem; }
+  .badge.prompt { background: #1e3a5f; }
+  .badge.response { background: #4a2f1e; }
+</style>
+</head>
+<body>
+
+<h1>Sentinel — Manual Labelling Queue</h1>
+<div id="stats">Loading…</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Text</th>
+      <th>Type</th>
+      <th>Model label / score</th>
+      <th>Session</th>
+      <th>Your label</th>
+      <th>Decision</th>
+    </tr>
+  </thead>
+  <tbody id="queue-body"></tbody>
+</table>
+
+<button id="trigger">Trigger Retraining</button>
+<span id="trigger-status"></span>
+
+<script>
+async function loadStats() {
+  const r = await fetch('/api/stats');
+  const s = await r.json();
+  document.getElementById('stats').innerHTML =
+    `pending: <b>${s.pending}</b> &nbsp; accepted: <b>${s.accepted}</b> &nbsp; rejected: <b>${s.rejected}</b>`;
+}
+
+async function loadQueue() {
+  const r = await fetch('/api/queue?limit=100');
+  const rows = await r.json();
+  const body = document.getElementById('queue-body');
+  body.innerHTML = '';
+  for (const doc of rows) {
+    const tr = document.createElement('tr');
+    tr.id = `row-${doc.id}`;
+
+    const labelSelect = `
+      <select id="label-${doc.id}">
+        <option value="safe">safe</option>
+        <option value="harm">harm</option>
+      </select>`;
+
+    tr.innerHTML = `
+      <td class="text">${escapeHtml(doc.input_text || '')}</td>
+      <td><span class="badge ${doc.text_type || ''}">${doc.text_type || '—'}</span></td>
+      <td>${doc.label || '—'} / ${doc.score !== undefined ? doc.score.toFixed(2) : '—'}</td>
+      <td>${escapeHtml(doc.session_id || '—')}</td>
+      <td>${labelSelect}</td>
+      <td>
+        <button class="accept" onclick="save('${doc.id}', 'accepted')">Accept</button>
+        <button class="reject" onclick="save('${doc.id}', 'rejected')">Reject</button>
+      </td>`;
+    body.appendChild(tr);
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function save(docId, decision) {
+  const manualLabel = document.getElementById(`label-${docId}`).value;
+  const resp = await fetch(`/api/label/${docId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ manual_label: manualLabel, training_decision: decision }),
+  });
+  if (resp.ok) {
+    const row = document.getElementById(`row-${docId}`);
+    row.classList.add('row-saved');
+    loadStats();
+  }
+}
+
+document.getElementById('trigger').addEventListener('click', async () => {
+  const btn = document.getElementById('trigger');
+  const status = document.getElementById('trigger-status');
+  btn.disabled = true;
+  status.textContent = 'Triggering…';
+  try {
+    const r = await fetch('/api/trigger-retrain', { method: 'POST' });
+    const body = await r.json();
+    if (r.ok) {
+      status.textContent = `Started: ${body.dag_run_id} (${body.state})`;
+    } else {
+      status.textContent = `Failed: ${body.detail || r.status}`;
+    }
+  } catch (e) {
+    status.textContent = `Failed: ${e}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+loadStats();
+loadQueue();
+</script>
+</body>
+</html>

@@ -93,14 +93,25 @@ def write_flagged_content(
     # Spans without a span_id have no natural key to dedupe on (same gap that
     # already exists for classifications' partial unique index) — insert
     # those directly; upsert the rest keyed on (span_id, text_type).
+    #
+    # manual_label/training_decision (set by services/label-ui) go in
+    # $setOnInsert, not $set: a Kafka redelivery of an already-labelled span
+    # re-runs this upsert with the same ingestion fields, and $set would
+    # silently overwrite a completed manual label back to "pending" every
+    # time. $setOnInsert only applies the defaults the first time the
+    # document is created, so relabelling data can never be clobbered by
+    # redelivery.
     operations = [
         pymongo.UpdateOne(
             {"span_id": doc["span_id"], "text_type": doc["text_type"]},
-            {"$set": doc},
+            {
+                "$set": doc,
+                "$setOnInsert": {"manual_label": None, "training_decision": "pending"},
+            },
             upsert=True,
         )
         if doc["span_id"]
-        else pymongo.InsertOne(doc)
+        else pymongo.InsertOne({**doc, "manual_label": None, "training_decision": "pending"})
         for doc in docs
     ]
     # ordered=False: one bad op doesn't block the rest from committing, so a

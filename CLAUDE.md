@@ -135,7 +135,7 @@ sentinel/
     evaluate/          ← accuracy + latency benchmarks (K8s Job)
     retrain/           ← fine-tuning scripts, called by Airflow
     drift/             ← PySpark PSI/JSD jobs (spark-submit, own pyproject.toml)
-  dags/                ← Airflow DAG definitions (orchestrates pipelines/)
+  orchestration/       ← Airflow DAG definitions (orchestrates pipelines/)
   datasets/            ← shared data loading utilities
   infra/               ← Terraform + Helm charts
 ```

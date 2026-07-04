@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -50,6 +51,52 @@ def upload_report(run_id: str, report_path: Path) -> str | None:
         return f"{_BUCKET}/{key}"
     except (BotoCoreError, ClientError, OSError) as exc:
         logger.warning("MinIO report upload failed — report kept locally only. Reason: %s", exc)
+        return None
+
+
+def upload_benchmark_report(run_id: str, report_path: Path) -> str | None:
+    """Upload a benchmark report JSON to MinIO at models/<run-id>/benchmark_report.json.
+
+    A separate key from upload_report's report.json (the optimizer's own
+    stage-timing report) — this one lets a *later* retrain's quality gate
+    look up a specific model_version's accuracy/f1/etc. as a regression
+    baseline (see pipelines/retraining/pipeline.py's _get_baseline_report)
+    without re-running inference against it. Same non-fatal-on-failure
+    contract as upload_report.
+    """
+    try:
+        s3 = _s3_client()
+        key = f"{run_id}/benchmark_report.json"
+        logger.info("Uploading benchmark report → s3://%s/%s", _BUCKET, key)
+        s3.upload_file(str(report_path), _BUCKET, key)
+        return f"{_BUCKET}/{key}"
+    except (BotoCoreError, ClientError, OSError) as exc:
+        logger.warning(
+            "MinIO benchmark report upload failed — report kept locally only. Reason: %s", exc
+        )
+        return None
+
+
+def download_report(run_id: str, filename: str) -> dict | None:
+    """Download and parse a JSON report from MinIO at models/<run-id>/<filename>.
+
+    Returns None whenever the report isn't available for any reason —
+    MinIO unreachable, the key doesn't exist (e.g. a run that predates
+    benchmark-report uploads), or the body isn't valid JSON. Callers should
+    treat None as "no data to use," not as an error to propagate; the two
+    failure modes aren't distinguished on purpose, since every caller's
+    correct response to either is the same (fall back to not having this
+    report).
+    """
+    try:
+        s3 = _s3_client()
+        key = f"{run_id}/{filename}"
+        obj = s3.get_object(Bucket=_BUCKET, Key=key)
+        return json.loads(obj["Body"].read())
+    except (BotoCoreError, ClientError, OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Could not download/parse s3://%s/%s: %s", _BUCKET, f"{run_id}/{filename}", exc
+        )
         return None
 
 
