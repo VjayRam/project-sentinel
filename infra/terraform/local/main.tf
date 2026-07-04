@@ -117,6 +117,13 @@ resource "kubernetes_config_map" "postgres_init" {
     "02_airflow_db.sql" = <<-SQL
       CREATE DATABASE airflow OWNER sentinel;
     SQL
+
+    # MLflow's own backend store (experiments, runs, params, metrics) — a
+    # separate database on the same instance, same reasoning as Airflow's:
+    # reuse existing infra rather than standing up a second PostgreSQL.
+    "03_mlflow_db.sql" = <<-SQL
+      CREATE DATABASE mlflow OWNER sentinel;
+    SQL
   }
 }
 
@@ -284,6 +291,10 @@ resource "kubernetes_config_map" "mongodb_init" {
       db.flagged_content.createIndex({ ts: -1 });
       db.flagged_content.createIndex({ label: 1, ts: -1 });
       db.flagged_content.createIndex({ model_version: 1, ts: -1 });
+
+      // services/label-ui's queue query: docs still awaiting a manual
+      // labelling decision, oldest first.
+      db.flagged_content.createIndex({ training_decision: 1, ts: 1 });
 
       // Mirrors the partial unique index on classifications (span_id, text_type)
       // in Postgres — enforces idempotency at the DB level so Kafka redelivery
@@ -595,6 +606,7 @@ resource "kubernetes_service" "minio" {
 # Buckets created:
 #   models    — ONNX artifacts uploaded by the optimizer pipeline
 #   datasets  — training data archives used by the retrain pipeline
+#   mlflow    — MLflow's artifact store (default_artifact_root, s3://mlflow/)
 
 resource "kubernetes_job_v1" "minio_init" {
   metadata {
@@ -622,6 +634,7 @@ resource "kubernetes_job_v1" "minio_init" {
               done
               mc mb --ignore-existing minio/models
               mc mb --ignore-existing minio/datasets
+              mc mb --ignore-existing minio/mlflow
               echo "Buckets ready."
             SCRIPT
           ]

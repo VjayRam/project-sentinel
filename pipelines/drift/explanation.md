@@ -7,6 +7,16 @@ on. Runs to completion and exits — this is a K8s `Job` (via the
 `SparkApplication` CRD), not a `Deployment`, matching the repo's
 service-vs-job split described in the root `CLAUDE.md`.
 
+**Phase 7.4 update**: this job now runs automatically, hourly, via
+[`../../orchestration/drift_dag.py`](../../orchestration/explanation.md) —
+`spark-application.yaml` in this directory is still the reference manifest
+(and still useful for a manual `kubectl apply -f` test independent of
+Airflow), but the actual submitted resource each hour is a copy of it with
+a unique generated name, created directly via the Kubernetes API rather
+than this file. See that DAG's explanation for the full story, including
+why the higher-level `SparkKubernetesOperator`/`SparkKubernetesSensor`
+Airflow operators were tried first and abandoned.
+
 ---
 
 ## Why PySpark for what's currently a few thousand floats
@@ -121,17 +131,32 @@ LIMIT 1
 ```
 
 "Whichever pod self-registered most recently" is what's actually running
-and writing classifications right now — nothing in the current phase
-(Airflow/Phase 7 promotion logic doesn't exist yet) reliably keeps
-`status='active'` pointed at the right namespace. This is a known, accepted
-gap: once `retrain_dag.py`'s promotion step lands and starts flipping
-`status` deliberately (rather than every pod self-registering as
-`'staging'` on boot), this query should probably go back to preferring
-`'active'`. Until then, `created_at DESC` is the honest answer. Still
-subject to the same rolling-restart race noted in the code comment — old-
-and new-version pods can both self-register within moments of each other —
-just no longer compounded by a status filter pointing at the wrong
-`model_version` namespace altogether.
+and writing classifications right now — at the time this was fixed,
+nothing reliably kept `status='active'` pointed at the right namespace.
+This was a known, accepted gap: once `retrain_dag.py`'s promotion step
+landed and started flipping `status` deliberately (rather than every pod
+self-registering as `'staging'` on boot), this query should probably go
+back to preferring `'active'`. Still subject to the same rolling-restart
+race noted in the code comment — old- and new-version pods can both
+self-register within moments of each other — just no longer compounded by
+a status filter pointing at the wrong `model_version` namespace
+altogether.
+
+**Update, now that `retrain_dag.py`'s promotion step exists (Phase 7.3):**
+the gap hasn't fully closed on its own. Live-tested during `drift_dag.py`'s
+(Phase 7.4) end-to-end verification: `model_registry`'s `active` row
+pointed at a `model_version` with **zero** rows in `classifications` —
+promoted during retraining-pipeline testing, but never actually served
+real traffic, because no classifier pod had been rolled out against it
+with real requests flowing yet. `get_active_model_version()`'s
+`created_at DESC` (ignoring status) correctly fell back to the most
+recently *self-registered* version instead, which is exactly the row with
+real data — so the existing fix continues to be the right one even with
+promotion logic now in place. The underlying lesson holds either way:
+`model_registry.status='active'` answers "which model *should* be
+serving," not "which `model_version` string is actually showing up in
+`classifications` right now" — and this pipeline specifically needs the
+second answer, not the first.
 
 **Lesson for future "obvious" fixes in this codebase:** when a query joins
 two tables/processes that evolved independently, verify the *values*

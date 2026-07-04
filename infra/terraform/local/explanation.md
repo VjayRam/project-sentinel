@@ -835,6 +835,194 @@ kubectl exec -n sentinel-pipeline airflow-scheduler-0 -c scheduler -- \
   airflow dags list-runs -d healthcheck
 ```
 
+**9. Editing a DAG file and re-applying Terraform updates the ConfigMap, but
+not the mounted file — a direct consequence of gotcha #4's own fix.**
+Mounting each DAG via `subPath` (to dodge the DAG-walker's recursive-loop
+bug) means bypassing the `..data -> ..<timestamp>` symlink Kubernetes
+normally uses to make ConfigMap updates appear live with no pod restart.
+Trading away the symlink to fix the walker also trades away the live-update
+behavior — confirmed live by editing `orchestration/retrain_dag.py`,
+running `terraform apply`, and `grep`-ing the file's content inside the
+scheduler pod to find it unchanged. **Any DAG file edit needs an explicit
+restart of both pods that mount it:**
+```bash
+kubectl rollout restart statefulset/airflow-scheduler -n sentinel-pipeline
+kubectl rollout restart deployment/airflow-webserver -n sentinel-pipeline
+```
+
+**10. The stable REST API needs its own auth backend enabled — the
+webserver UI login working doesn't imply the API accepts the same
+credentials.** `services/label-ui` triggers `retrain_dag` via `POST
+/api/v1/dags/retrain_dag/dagRuns` using HTTP Basic auth with the same
+admin/`<password>` the UI login form uses — but the REST API validates
+requests against `[api] auth_backends`, a separate config surface from the
+webserver's own session-based login. Without setting it explicitly, that
+first API call failed even though the UI login worked fine. Fixed with an
+explicit `config` block in the Helm values (matching this file's established
+"don't trust chart defaults silently" pattern — see gotcha #2):
+```hcl
+config = {
+  api = { auth_backends = "airflow.api.auth.backend.basic_auth" }
+}
+```
+
+**11. `KubernetesPodOperator` needs its own RBAC — separate from the
+rollout-restart Role.** `retrain_dag.py`'s `run_retraining` task launches a
+pod (`sentinel-retraining:local`) to do the actual fine-tuning — this needs
+permission to `create`/`get`/`list`/`watch`/`delete` `pods` (+ `get`/`list`
+on `pods/log`) in `sentinel-pipeline`, which is a *different* permission
+from `kubernetes_role.airflow_rollout`'s `apps/deployments` patch access in
+`sentinel-app`. Added as a second Role/RoleBinding pair
+(`airflow_pod_launcher`) bound to the same `airflow` ServiceAccount — same
+shape as `spark_driver`'s Role, just for a different SA:
+```hcl
+resource "kubernetes_role" "airflow_pod_launcher" {
+  rule { api_groups = [""]; resources = ["pods"];     verbs = ["create","get","list","watch","delete"] }
+  rule { api_groups = [""]; resources = ["pods/log"]; verbs = ["get","list"] }
+}
+```
+
+**12. A third RBAC surface: custom resources are their own API group,
+separate from core-API pods.** `drift_dag.py` (Phase 7.4) submits/polls/
+deletes a `SparkApplication` — a custom resource in the
+`sparkoperator.k8s.io` group, not the core `""` group `airflow_pod_launcher`
+above covers. Needed its own Role:
+```hcl
+resource "kubernetes_role" "airflow_spark_application" {
+  rule {
+    api_groups = ["sparkoperator.k8s.io"]
+    resources  = ["sparkapplications", "sparkapplications/status"]
+    verbs      = ["create", "get", "list", "watch", "delete"]
+  }
+}
+```
+This is unrelated to `spark_driver`'s Role (`main.tf`) — that one lets the
+**driver pod** manage its own executor pods once spark-operator's
+controller has already created it from the CR; this one lets the
+**Airflow SA** create/watch/delete the CR in the first place.
+
+**13. `scheduler.env` needs `DATABASE_URL` explicitly — the scheduler pod
+has no way to reach the "sentinel" database otherwise.** `data.
+metadataConnection` above configures Airflow's connection to *its own*
+metadata database (named `airflow`) — a completely separate database on
+the same Postgres instance from `model_registry`/`drift_stats`/
+`classifications` (the `sentinel` database). Both `retrain_dag.py`'s
+`decide_promotion` and `drift_dag.py`'s `check_drift` read
+`os.environ["DATABASE_URL"]` directly to reach the latter. This was a
+**latent bug for a while**: `decide_promotion` was written and deployed
+without this env var ever being set, and it went unnoticed because the
+first test run raised its own `ValueError` (quality gate failed) *before*
+ever reaching the `psycopg2.connect(os.environ["DATABASE_URL"])` line —
+the missing env var only became visible once a run actually needed to read
+it. A reminder that a code path "working" in one test doesn't mean every
+line in it executed. Fixed by adding it to the scheduler's `env`, reusing
+the same `drift-postgres` secret already mirrored into this namespace for
+the drift job's driver pod — one secret, three consumers (the driver pod,
+`decide_promotion`, `check_drift`), no duplication.
+
+**14. A Connection was added, then removed, once the approach it supported
+was abandoned.** An earlier version of `drift_dag.py` used
+`apache-airflow-providers-cncf-kubernetes`'s `SparkKubernetesOperator`/
+`SparkKubernetesSensor`, which go through Airflow's own `KubernetesHook`
+and need a real `Connection` object (not just "happens to be running
+in-cluster") — added via `AIRFLOW_CONN_KUBERNETES_DEFAULT` as a JSON env
+var (`jsonencode({conn_type = "kubernetes", extra = {in_cluster = true}})`
+— JSON has worked directly in `AIRFLOW_CONN_*` since Airflow 2.3, sidestepping
+the fragile provider-specific URI-extra-field encoding). That whole
+approach was later abandoned (see
+[`../../orchestration/explanation.md`](../../orchestration/explanation.md)'s
+`drift_dag.py` section for why) in favor of plain
+`kubernetes.config.load_incluster_config()` calls, which need no Airflow
+Connection at all — so this env var was removed again once nothing
+referenced it. Worth knowing if you ever see a stray `AIRFLOW_CONN_*` var
+that looks orphaned: check whether the code that needed it is still there
+before assuming it's still load-bearing.
+
+---
+
+### MLflow (sentinel-monitoring, `mlflow.tf`)
+
+A `kubernetes_deployment`/`kubernetes_service` pair, not a Helm chart — no
+official chart exists for MLflow the way one does for Airflow. Deployment
+(not StatefulSet), same reasoning as Grafana: all real state lives
+elsewhere (Postgres backend store, MinIO artifact store), so the pod itself
+is stateless and freely reschedulable.
+
+```hcl
+args = [
+  "server",
+  "--backend-store-uri", "postgresql://sentinel:$(PG_PASSWORD)@postgresql.../mlflow",
+  "--default-artifact-root", "s3://mlflow/",
+  "--serve-artifacts",
+  "--workers", "2",
+  "--allowed-hosts", join(",", ["localhost", "localhost:5000", "mlflow", ...]),
+]
+```
+
+**Custom image, not the official one directly** (`infra/mlflow/Dockerfile`,
+own explanation.md) — `ghcr.io/mlflow/mlflow` doesn't bundle a Postgres
+driver or S3 client, so `--backend-store-uri postgresql://...` and
+`--default-artifact-root s3://...` both fail to start against the base
+image.
+
+**Reuses existing infra rather than standing up new stateful services** —
+same philosophy as Airflow's separate `airflow` database on the existing
+Postgres instance: a `03_mlflow_db.sql` init script adds an `mlflow`
+database, and the MinIO bucket-init Job gets an `mlflow` bucket alongside
+`models`/`datasets`.
+
+**Three live-only bugs, all found by actually deploying it, not by reading
+docs:**
+
+1. **The `03_mlflow_db.sql` init script never ran** — same class of gotcha
+   as Airflow's #1: Postgres init scripts only execute against a *fresh*
+   data directory, and this cluster's Postgres already had data from
+   earlier phases. Fixed the same way: create the database manually once
+   against the live instance (`CREATE DATABASE mlflow OWNER sentinel;`);
+   the SQL script stays in `main.tf` so a from-scratch cluster still gets
+   it automatically.
+2. **OOMKilled at both 512Mi and 1Gi memory limits.** MLflow's FastAPI/
+   uvicorn tracking server defaults to 4 worker processes — heavier than
+   the single-process Grafana/Jaeger images this resource block was
+   originally copied from. Fixed with `--workers 2` and a `2Gi`/`768Mi`
+   limit/request — the node had ~10Gi free the whole time, this was purely
+   a cgroup limit being too tight, not real memory pressure.
+3. **403 "Invalid Host header — possible DNS rebinding attack detected"**
+   when the retraining pod (a different namespace) connected. MLflow 3.5+
+   ships a security middleware that only allows `localhost` + private IPs
+   by default — an in-cluster DNS name like
+   `mlflow.sentinel-monitoring.svc.cluster.local` isn't recognized.
+   `--allowed-hosts` **replaces** the default rather than extending it, so
+   `localhost` had to be re-added explicitly too, or the port-forwarded
+   UI/browser access would have broken instead. Matching is against the
+   full `Host:port` header, not just the hostname — bare `mlflow` 403'd
+   just like the DNS name did until the `:5000`-suffixed forms were added
+   too.
+
+---
+
+### Label UI (sentinel-app, `label-ui.tf`)
+
+Plain `kubernetes_deployment`/`kubernetes_service`, same shape as
+classifier/stream-processor — no new pattern introduced. The only thing
+worth noting here is credential mirroring: this service needs both the
+`sentinel-app`-local `app_mongodb` secret (already mirrored there for other
+app services) *and* `airflow_admin_password`, which otherwise only exists
+in `sentinel-pipeline` — K8s Secrets are namespace-scoped, so a new
+`app_airflow` secret mirrors that one value into `sentinel-app` too, same
+pattern as `app_mongodb`/`app_minio`.
+
+```hcl
+resource "kubernetes_secret" "app_airflow" {
+  metadata { name = "airflow-credentials"; namespace = "sentinel-app" }
+  data     = { admin-password = var.airflow_admin_password }
+}
+```
+
+See [`../../services/label-ui/explanation.md`](../../services/label-ui/explanation.md)
+for what the service actually does with these credentials (triggering
+`retrain_dag` via Airflow's REST API).
+
 ---
 
 ## outputs.tf
@@ -859,6 +1047,12 @@ $(terraform output -raw otel_collector_grpc_port_forward) &
 different port numbers on each side; only the local side needed to move here
 (k3d's own load balancer already owns host port 8080), the Service and pod
 both still listen on 8080 internally.
+
+**`mlflow_port_forward` / label-ui's port** — MLflow's UI is at
+`http://localhost:5000` after `kubectl port-forward -n sentinel-monitoring
+svc/mlflow 5000:5000`; the labelling UI is at `http://localhost:8001` via
+`kubectl port-forward -n sentinel-app svc/label-ui 8001:8001`. Both are
+symmetric (same port on both sides) — 5000 and 8001 were simply free.
 
 ---
 

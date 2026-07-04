@@ -578,6 +578,23 @@ the same document instead of inserting a second one. Documents with no
 `span_id` (same gap as the PostgreSQL side: nothing to dedupe on) fall back
 to a plain `pymongo.InsertOne`.
 
+**`$setOnInsert` for `manual_label`/`training_decision`, not `$set` — this
+is the difference between preserving and clobbering a human's work.** These
+two fields are owned by `services/label-ui` (see its explanation.md), not
+by this writer — they hold the manual safe/harm label and accept/reject
+decision an operator makes in the labelling UI, used later by
+`pipelines/retraining` to build its fine-tuning dataset. The upsert's `$set`
+clause only ever contains the ingestion fields (`ts`, `input_text`, `label`,
+`score`, etc.) — never these two. If a Kafka redelivery re-runs this same
+upsert after an operator has already labelled the document, `$set` would
+silently overwrite `manual_label`/`training_decision` back to their
+defaults, discarding completed manual work with no error and no trace. Live
+verified: labelled a doc via the UI, simulated a redelivery by re-running
+this exact upsert, and confirmed the label field was untouched while
+`input_text`/`score`/`ts` correctly updated to the new values. Documents
+with no `span_id` get the defaults set directly in the `InsertOne` payload
+instead, since there's no upsert-vs-insert distinction to protect there.
+
 **`ordered=False` on `bulk_write`** — with the default `ordered=True`,
 MongoDB stops processing the batch at the first failing operation, leaving
 every operation after it un-run even if they'd have succeeded independently.
@@ -595,15 +612,21 @@ happens.
   "ts":           "ISODate — when the classification ran",
   "input_text":   "the text that was classified",
   "text_type":    "prompt or response",
-  "label":        "harm or safe",
+  "label":        "harm or safe (the MODEL's own classification)",
   "score":        0.97,
   "model_version": "sentinel-roberta-20260627T003749Z-int8",
   "session_id":   "conversation session from the chat app",
   "span_id":      "OTLP hex span ID",
   "trace_id":     "OTLP hex trace ID (links to Jaeger)",
-  "llm_model":    "gpt-4o (which LLM the chat app called)"
+  "llm_model":    "gpt-4o (which LLM the chat app called)",
+  "manual_label":       "safe | harm | null — set by a human via label-ui, not this writer",
+  "training_decision":  "pending | accepted | rejected — defaults to pending via $setOnInsert"
 }
 ```
+
+`manual_label`/`training_decision` start `null`/`"pending"` on every document
+this writer creates and are never touched by it again — only
+`services/label-ui`'s `POST /api/label/{doc_id}` route updates them.
 
 The `trace_id` field is particularly useful: it links each classified span to
 the full distributed trace in Jaeger, letting you see the entire conversation

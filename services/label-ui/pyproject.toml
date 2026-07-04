@@ -1,0 +1,11 @@
+[project]
+name = "sentinel-label-ui"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "pymongo>=4.9",
+    "httpx>=0.28",
+    "pydantic-settings>=2.3",
+]
