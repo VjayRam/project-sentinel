@@ -1,8 +1,18 @@
+<p align="center">
+  <img src="assets/sentinel-logo.png" alt="Sentinel logo" width="160">
+</p>
+
 # Sentinel
 
 A content safety monitoring platform for LLM applications. Sentinel receives OpenTelemetry traces from a chat app, classifies prompt/response text for toxicity, detects when the model's input distribution drifts, and automatically retrains and redeploys a new model version — with a human-in-the-loop labelling step in between.
 
 Built as a learning project — every tool is introduced one phase at a time with production-grade patterns. All 7 local-dev phases below are complete; only cloud deployment (Phase 8) remains.
+
+<p align="center">
+  <img src="assets/sentinel-video.gif" alt="Sentinel demo" width="720">
+  <br>
+  <sub>Full video: <a href="assets/sentinel-video.mp4">assets/sentinel-video.mp4</a></sub>
+</p>
 
 ## What it does
 
