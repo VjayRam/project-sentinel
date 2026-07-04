@@ -12,11 +12,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import mlflow
+import psycopg
 import pymongo
 
 from pipelines.evaluation.benchmark import run as run_benchmark
 from pipelines.evaluation.validate import validate
 from pipelines.optimizer.pipeline import run as run_optimizer
+from pipelines.optimizer.registry import DSN
+from pipelines.optimizer.upload import download_report, upload_benchmark_report
 from pipelines.retraining.dataset import build_dataset
 from pipelines.retraining.train import train
 
@@ -25,6 +28,48 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _get_baseline_report() -> dict | None:
+    """Best-effort lookup of the currently active model's stored benchmark
+    report, to pass as validate()'s regression baseline.
+
+    Every failure path here returns None rather than raising, and None is
+    exactly what validate() already treats as "skip the regression check,
+    apply only the absolute accuracy floor" — the safe, correct behavior
+    for the very first retrain ever (no active model to compare against
+    yet) is unchanged. What this adds is the regression check actually
+    running once there IS an active model with a stored report — without
+    it, an unattended drift-triggered retrain (orchestration/drift_dag.py)
+    could promote a model that regressed accuracy relative to the one
+    already serving traffic, since only the absolute floor gated it.
+    """
+    try:
+        with psycopg.connect(DSN) as conn:
+            row = conn.execute(
+                "SELECT model_path FROM model_registry WHERE status = 'active' LIMIT 1"
+            ).fetchone()
+    except psycopg.Error:
+        logger.warning("Could not query model_registry for a baseline model", exc_info=True)
+        return None
+
+    if row is None:
+        logger.info("No active model yet — nothing to regression-check against")
+        return None
+
+    active_model_path = row[0]
+    if active_model_path.startswith("/"):
+        # Local-fallback path (MinIO was unreachable when that model was
+        # optimized) — no MinIO run_id to look up a stored report under.
+        logger.warning("Active model_path is a local fallback path — no stored baseline available")
+        return None
+
+    # active_model_path is "models/<run_id>/int8/model_quantized.onnx".
+    run_id = active_model_path.split("/")[1]
+    baseline = download_report(run_id, "benchmark_report.json")
+    if baseline is None:
+        logger.warning("No stored benchmark_report.json for active model run_id=%s", run_id)
+    return baseline
 
 
 def run(
@@ -45,7 +90,34 @@ def run(
     logger.info("Starting retraining pipeline | run_id=%s", run_id)
 
     mongo_db = pymongo.MongoClient(mongo_uri).get_default_database()
-    dataset = build_dataset(mongo_db, initial_dataset_path, sample_size)
+    try:
+        dataset = build_dataset(mongo_db, initial_dataset_path, sample_size)
+    except ValueError as exc:
+        # No accepted training data yet — a real, expected condition on a
+        # fresh deployment or whenever orchestration/drift_dag.py's hourly
+        # schedule fires automatically before any operator has used
+        # services/label-ui. Reported as a clean gate failure instead of
+        # letting the exception crash the task: retrain_dag.py's
+        # decide_promotion already handles gate_passed=False correctly
+        # (raises its own clear error, no promotion, rollout_restart
+        # skipped) — this keeps that single, already-correct failure path
+        # instead of adding a second, differently-shaped one.
+        logger.warning("Cannot build training dataset — %s", exc)
+        report = {
+            "run_id": run_id,
+            "gate_passed": False,
+            "gate_reasons": [str(exc)],
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        report_path = run_log / "report.json"
+        report_path.write_text(json.dumps(report, indent=2))
+        xcom_dir = Path("/airflow/xcom")
+        if xcom_dir.exists():
+            (xcom_dir / "return.json").write_text(json.dumps(report))
+        logger.info(
+            "Retraining pipeline stopped early | run_id=%s | reason=no training data", run_id
+        )
+        return report_path
 
     # MLFLOW_TRACKING_URI is env-var driven (mlflow's client reads it
     # automatically) rather than set here, matching how DATABASE_URL/
@@ -70,7 +142,16 @@ def run(
     int8_dir = Path(optimizer_report["stages"]["quantize"]["output"])
 
     benchmark_report = run_benchmark(model_dir=str(int8_dir))
-    gate_passed, reasons = validate(benchmark_report)
+
+    # Uploaded under this run's own model_version so a LATER retrain can use
+    # it as a regression baseline (see _get_baseline_report) without ever
+    # needing to re-run inference against an old model.
+    benchmark_report_path = run_log / "benchmark_report.json"
+    benchmark_report_path.write_text(json.dumps(benchmark_report, indent=2))
+    upload_benchmark_report(optimizer_report["run_id"], benchmark_report_path)
+
+    baseline_report = _get_baseline_report()
+    gate_passed, reasons = validate(benchmark_report, baseline=baseline_report)
 
     report = {
         "run_id": run_id,
@@ -81,6 +162,7 @@ def run(
         "val_size": len(dataset["val"]),
         "final_train_eval_metrics": train_result,
         "benchmark": benchmark_report,
+        "baseline_accuracy": baseline_report["accuracy"] if baseline_report else None,
         "gate_passed": gate_passed,
         "gate_reasons": reasons,
         "model_version": optimizer_report["run_id"],

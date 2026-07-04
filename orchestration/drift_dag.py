@@ -126,11 +126,18 @@ spec:
         value: /usr/bin/python3
 """
 
-# How old a drift_stats row can be and still count as "this run's result."
-# The drift Spark job (small dataset, 2 executors) typically finishes in
-# well under this window — generous on purpose so a slow node doesn't cause
-# a false "job didn't run" verdict.
+# Fallback only — see _check_drift. Primary correlation is against this
+# run's own submission timestamp (pushed by _submit_drift_job), not a
+# wall-clock guess; this window only applies if that XCom is unexpectedly
+# missing. The drift Spark job (small dataset, 2 executors) typically
+# finishes in well under this window.
 FRESHNESS_WINDOW = timedelta(minutes=30)
+
+# Absorbs clock skew between the scheduler pod (where submitted_at is
+# recorded) and the Spark driver pod (which writes drift_stats.computed_at)
+# — real K8s nodes are NTP-synced to well under this, it's a generous
+# margin, not a measured value.
+CLOCK_SKEW_GRACE = timedelta(seconds=30)
 
 # Bounds how long wait_for_drift_job polls before giving up. The one
 # pre-existing successful manual run (before this DAG existed) took ~42s
@@ -155,17 +162,37 @@ def _submit_drift_job(**context) -> str:
     name = f"sentinel-drift-{uuid.uuid4().hex[:8]}"
     manifest["metadata"]["name"] = name
 
+    # Recorded before submission so _check_drift can correlate a
+    # drift_stats row against THIS run precisely, rather than guessing
+    # from wall-clock age alone (a row written before this run even
+    # started can't be this run's result, no matter how "fresh" it looks
+    # by age).
+    submitted_at = datetime.now(timezone.utc)
     api.create_namespaced_custom_object(
         group=API_GROUP, version=API_VERSION, namespace=NAMESPACE, plural=PLURAL, body=manifest
     )
     logger.info("Submitted SparkApplication %s", name)
-    return name  # auto-XComed
+    context["ti"].xcom_push(key="submitted_at", value=submitted_at.isoformat())
+    return name  # auto-XComed under the default "return_value" key
 
 
 def _wait_for_drift_job(**context) -> None:
     from kubernetes import client, config
 
     name = context["ti"].xcom_pull(task_ids="submit_drift_job")
+    if not name:
+        # trigger_rule="all_done" means this runs even if submit_drift_job
+        # failed before its `return name` line — nothing to poll for.
+        # Passing name=None to the K8s API below raises
+        # kubernetes.client.exceptions.ApiValueError, which does NOT
+        # inherit from ApiException (confirmed live against the actual
+        # installed client) — the except clause further down wouldn't
+        # catch it, and this task would crash with a confusing "missing
+        # required parameter" error instead of the intended "run no matter
+        # what happened upstream" behavior. cleanup_drift_job already
+        # guards this same case.
+        logger.warning("No SparkApplication name from submit_drift_job — nothing to wait for")
+        return
 
     config.load_incluster_config()
     api = client.CustomObjectsApi()
@@ -218,7 +245,34 @@ def _cleanup_drift_job(**context) -> None:
 
 
 def _check_drift(**context) -> str:
+    """Reads drift_stats directly for the branch decision — see the module
+    docstring for why the SparkApplication's own pass/fail status isn't a
+    reliable signal here.
+
+    Known, accepted limitation: this function has no way to distinguish
+    "the drift job hit a real error" from "it ran fine and had nothing new
+    to report" — both produce a stale-or-missing drift_stats row relative
+    to this run's submission. Both correctly fall back to
+    no_drift_detected below (never retrain on an ambiguous signal), but
+    that also means a genuine outage in the drift pipeline currently
+    produces no distinct alerting signal, only a silent no-op. A real fix
+    belongs in pipelines/drift/drift_job.py's exit-code/status semantics
+    (e.g. an explicit status column in drift_stats distinguishing
+    ok/skipped/error, rather than overloading "no fresh row" to mean all
+    three) — deliberately not attempted here, since it touches a
+    separately-tested pipeline this PR didn't otherwise modify, and the
+    current fallback behavior is safe, just not observable.
+    """
+    # psycopg2, not psycopg (v3, used everywhere else in this repo,
+    # including pipelines/drift/db.py's own drift_stats queries) —
+    # deliberate: confirmed live that this Airflow image only bundles
+    # psycopg2 (a transitive dependency of apache-airflow-providers-
+    # postgres), not psycopg. See orchestration/retrain_dag.py's
+    # _decide_promotion for the same note.
     import psycopg2
+
+    submitted_at_str = context["ti"].xcom_pull(task_ids="submit_drift_job", key="submitted_at")
+    submitted_at = datetime.fromisoformat(submitted_at_str) if submitted_at_str else None
 
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     try:
@@ -236,20 +290,37 @@ def _check_drift(**context) -> str:
         return "no_drift_detected"
 
     drift_flagged, computed_at, psi = row
-    age = datetime.now(timezone.utc) - computed_at
-    if age > FRESHNESS_WINDOW:
-        # The drift job didn't write anything new this run — either it hit
-        # drift_job.py's MIN_REFERENCE_SIZE guard, found no current-window
-        # rows, or genuinely crashed before reaching write_drift_stats().
-        # Any of those means "we don't know," and "we don't know" must
-        # never trigger a retrain.
-        logger.warning(
-            "Latest drift_stats row is stale (age=%s > %s) — drift job likely "
-            "didn't write new data this run; not triggering retrain",
-            age,
-            FRESHNESS_WINDOW,
-        )
-        return "no_drift_detected"
+
+    if submitted_at is not None:
+        # Precise correlation to THIS run's own submission, not a
+        # wall-clock guess — a row written before this run even started
+        # can't be this run's result no matter how "fresh" it looks by age
+        # alone (e.g. a previous run's row that's only 10 minutes old would
+        # pass a naive age check but still be the wrong run's data).
+        if computed_at < submitted_at - CLOCK_SKEW_GRACE:
+            logger.warning(
+                "Latest drift_stats row (computed_at=%s) predates this run's "
+                "submission (submitted_at=%s) — drift job likely didn't write "
+                "new data this run; not triggering retrain",
+                computed_at,
+                submitted_at,
+            )
+            return "no_drift_detected"
+    else:
+        # Defensive fallback only — submit_drift_job's XCom should always
+        # be present by the time this task runs (trigger_rule=all_done
+        # means it still runs after a submit failure, but that failure
+        # would leave `row` reflecting an OLDER run anyway, which the
+        # wall-clock window below still catches in the common case).
+        age = datetime.now(timezone.utc) - computed_at
+        if age > FRESHNESS_WINDOW:
+            logger.warning(
+                "Latest drift_stats row is stale (age=%s > %s) and no submission "
+                "timestamp was available to correlate precisely — not triggering retrain",
+                age,
+                FRESHNESS_WINDOW,
+            )
+            return "no_drift_detected"
 
     logger.info("Latest drift_stats | psi=%.4f | drift_flagged=%s", psi, drift_flagged)
     return "trigger_retrain" if drift_flagged else "no_drift_detected"

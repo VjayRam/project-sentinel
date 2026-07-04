@@ -67,10 +67,15 @@ def build_dataset(
         logger.warning("initial_dataset_path=%s does not exist — skipping", initial_dataset_path)
 
     combined = accepted + initial
-    if not combined:
+    # Need at least 2 — one for training, one for validation. With exactly
+    # 1, n_val's max(1, ...) below would take that single example for val
+    # and leave train empty, silently constructing a Trainer with a
+    # zero-length train_dataset instead of failing loudly.
+    if len(combined) < 2:
         raise ValueError(
-            "No training data available — accept some flagged_content in the "
-            "labelling UI first, or pass --initial-dataset-path."
+            f"Only {len(combined)} labelled example(s) available — need at least 2 "
+            "(one for training, one for validation). Accept more flagged_content in "
+            "the labelling UI first, or pass --initial-dataset-path."
         )
 
     rng = random.Random(seed)

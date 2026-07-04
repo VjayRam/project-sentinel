@@ -44,6 +44,13 @@ APP_NAMESPACE = "sentinel-app"
 
 
 def _decide_promotion(**context) -> None:
+    # psycopg2, not psycopg (v3, used everywhere else in this repo —
+    # pipelines/optimizer/registry.py, pipelines/drift/db.py) —
+    # deliberate, not an inconsistency to clean up: confirmed live that
+    # this Airflow image only bundles psycopg2 (a transitive dependency of
+    # apache-airflow-providers-postgres, used for Airflow's own metadata
+    # DB), not psycopg. Switching this import to match the rest of the
+    # repo would break with ModuleNotFoundError in this specific runtime.
     import psycopg2
 
     report = context["ti"].xcom_pull(task_ids="run_retraining")
@@ -56,6 +63,22 @@ def _decide_promotion(**context) -> None:
         raise ValueError(f"Quality gate failed: {report.get('gate_reasons')}")
 
     model_version = report["model_version"]
+    model_path = report.get("model_path", "")
+    if model_path.startswith("/"):
+        # MinIO was unreachable when this model was optimized (see
+        # pipelines/optimizer/pipeline.py's local-fallback branch) — that
+        # path only ever existed inside run_retraining's own now-deleted
+        # pod (is_delete_operator_pod=True), unreachable from classifier/
+        # stream-processor pods after a rollout restart. Promoting it would
+        # leave "active" pointing at a model nothing can actually load —
+        # download.py would silently fall back to whatever model those
+        # pods already had, while model_registry claims the new one is live.
+        raise ValueError(
+            f"Refusing to promote model_version={model_version}: model_path "
+            f"{model_path!r} is a local fallback path, not a MinIO artifact "
+            "(MinIO was unreachable when this model was optimized)"
+        )
+
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     try:
         with conn.cursor() as cur:
@@ -65,6 +88,18 @@ def _decide_promotion(**context) -> None:
                 "WHERE model_version = %s",
                 (model_version,),
             )
+            if cur.rowcount == 0:
+                # No row matched model_version — e.g. this pod's own
+                # register_model() write somehow never committed. Without
+                # this check, the retire-UPDATE above would still commit,
+                # leaving model_registry with zero active rows. Roll back
+                # both statements together so the previously active model
+                # stays active instead.
+                conn.rollback()
+                raise RuntimeError(
+                    f"No model_registry row matched model_version={model_version!r} — "
+                    "not promoting; the previously active model remains active"
+                )
         conn.commit()
     finally:
         conn.close()

@@ -9,12 +9,13 @@ dependency when tp/fp/fn arithmetic is a few lines).
 """
 
 import logging
+import random
 import time
 from pathlib import Path
 
 import mlflow
 import numpy as np
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -28,6 +29,16 @@ logger = logging.getLogger(__name__)
 
 ID2LABEL = {0: "safe", 1: "harm"}
 LABEL2ID = {"safe": 0, "harm": 1}
+
+# _TrainMetricsCallback's per-epoch forward pass over the train split is
+# pure logging overhead, not part of the actual training step — its cost
+# must not scale unbounded with the training set size. This was part of
+# the root cause of an earlier OOM (see orchestration/retrain_dag.py's
+# container_resources comment); the real fix was dynamic per-batch padding
+# (this file's DataCollatorWithPadding), but capping the sample size here
+# bounds the remaining overhead regardless of how large the accepted-label
+# set grows in the future.
+MAX_TRAIN_METRICS_SAMPLES = 200
 
 
 class _TextDataset(Dataset):
@@ -80,13 +91,25 @@ class _TrainMetricsCallback(TrainerCallback):
     compute_metrics call comes back pre-labelled train_accuracy/train_f1/...),
     so both train_* and eval_* land in MLflow for every epoch.
 
+    Scores a fixed subset of at most MAX_TRAIN_METRICS_SAMPLES, not the
+    full train split — this is a diagnostic forward pass with no bearing
+    on the actual training step, and its cost shouldn't grow unbounded
+    with the training set. The same fixed subset (seeded, chosen once at
+    construction) is reused every epoch so metric trends across epochs are
+    comparable against a consistent sample rather than a new random draw
+    each time.
+
     trainer_ref is a one-element list populated after Trainer construction —
     the callback has to be built before the Trainer it references exists.
     """
 
     def __init__(self, trainer_ref: list, train_dataset):
         self._trainer_ref = trainer_ref
-        self.train_dataset = train_dataset
+        if len(train_dataset) > MAX_TRAIN_METRICS_SAMPLES:
+            indices = random.Random(0).sample(range(len(train_dataset)), MAX_TRAIN_METRICS_SAMPLES)
+            self.train_dataset = Subset(train_dataset, indices)
+        else:
+            self.train_dataset = train_dataset
 
     def on_epoch_end(self, args, state, control, **kwargs):
         trainer = self._trainer_ref[0]
