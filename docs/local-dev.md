@@ -61,9 +61,9 @@ curl http://localhost:8000/health/ready   # can it actually serve traffic right 
 ```
 Liveness and readiness are deliberately separate: liveness should almost never fail (it only signals "the process is fundamentally broken"), while readiness fails during model-load warmup and gracefully during shutdown. See [`services/classifier/explanation.md`](../services/classifier/explanation.md) for why conflating the two causes real outages.
 
-### `/v1/moderations` — the primary endpoint
+### `/v1/moderations` — the only classifier endpoint
 
-OpenAI-compatible; this is what the stream processor itself calls, and what any external chat-app integration should call too.
+OpenAI-compatible; this is what the stream processor itself calls, and what any external chat-app integration should call too. Accepts either a single string or a list — a single string is queued through `DynamicBatcher` (coalesces concurrent single-item calls into one ORT call per batch); a list is dispatched directly since the caller already batched it. (`/classify` and `/classify/batch` were removed — nothing called them, and this endpoint covers both shapes.)
 
 ```bash
 curl -s -X POST http://localhost:8000/v1/moderations \
@@ -81,21 +81,14 @@ curl -s -X POST http://localhost:8000/v1/moderations \
 }
 ```
 
-Pass `X-Sentinel-Skip-Persist: true` to skip the classifier's own async PostgreSQL write — used by the stream processor, which persists results itself (with `span_id` for idempotency) instead.
-
-### `/classify` and `/classify/batch` — internal/simple shape
-
-Still available for direct, non-OpenAI-shaped use:
+Single-string form:
 ```bash
-curl -s -X POST http://localhost:8000/classify \
+curl -s -X POST http://localhost:8000/v1/moderations \
   -H "Content-Type: application/json" \
-  -d '{"text": "you are an idiot"}' | jq .
-# {"label":"harm","score":0.9821,"latency_ms":34.2,"model_version":"...","inference_at":"..."}
-
-curl -s -X POST http://localhost:8000/classify/batch \
-  -H "Content-Type: application/json" \
-  -d '{"texts": ["hello world", "I will hurt you"]}' | jq .
+  -d '{"input": "you are an idiot"}' | jq .
 ```
+
+Pass `X-Sentinel-Skip-Persist: true` to skip the classifier's own async PostgreSQL write — used by the stream processor, which persists results itself (with `span_id` for idempotency) instead.
 
 ### Prometheus metrics
 ```bash

@@ -73,7 +73,7 @@ and lets collectors redact sensitive content without stripping the span entirely
 The stream processor's `processor.py` extracts text from these events.
 
 ### Classifier service design rules
-- ONNX Runtime's `session.run()` is a blocking C call — it must never run directly inline in an `async def` route, or it blocks the entire event loop. Routes are `async def` (for `DynamicBatcher`'s `await`-based queuing), but the actual inference call is always dispatched off the event loop: `/classify` goes through `DynamicBatcher` (batches concurrent single-text requests, runs one `predict()` call per batch via `run_in_executor`); `/classify/batch` and `/v1/moderations` call `run_in_executor(None, _classifier.predict, texts)` directly. The rule is "never block the loop with `session.run()`," not "the route must be `def`" — an `async def` route with the inference call executor-dispatched satisfies it just as well, and the batching gets you adaptive throughput a plain sync route wouldn't.
+- ONNX Runtime's `session.run()` is a blocking C call — it must never run directly inline in an `async def` route, or it blocks the entire event loop. `/v1/moderations` is the only classifier endpoint (accepts a single string or a list, OpenAI-moderation-compatible) and branches internally: a single-string input goes through `DynamicBatcher` (batches concurrent single-text requests, runs one `predict()` call per batch via `run_in_executor`); a list input is already batched by the caller, so it's dispatched directly via `run_in_executor(None, _classifier.predict, texts)`. The rule is "never block the loop with `session.run()`," not "the route must be `def`" — an `async def` route with the inference call executor-dispatched satisfies it just as well, and the batching gets you adaptive throughput a plain sync route wouldn't. (`/classify` and `/classify/batch` were removed — nothing in the system called them, and `/v1/moderations` covers both single and batch shapes on its own.)
 - **No `/reload` endpoint** — with multiple replicas, a reload hits only one pod, causing a silent model version split. Model upgrades always go through `kubectl rollout restart deployment/classifier`.
 - Model version comes from `model_registry` table on pod startup (not env var). Env var `MODEL_PATH` is only the fallback when DB is unreachable.
 - Prometheus metrics exposed at `/metrics` via `make_asgi_app()` — no separate server needed.
@@ -146,7 +146,7 @@ During learning phases, `pipelines/` scripts run locally. Don't force the K8s Jo
 
 ## Common Interview Points (Do Not Lose These in Refactors)
 
-- Classifier never runs `session.run()` inline in an event loop — always via `DynamicBatcher` or `run_in_executor`, never a blocking call directly inside `async def`
+- Classifier never runs `session.run()` inline in an event loop — always via `DynamicBatcher` (single-string `/v1/moderations` calls) or `run_in_executor` (list `/v1/moderations` calls), never a blocking call directly inside `async def`
 - Rolling restart for model upgrades — not in-process reload
 - Manual Kafka offset commit after DB write — not auto-commit
 - PSI and JSD as the drift metrics (PSI > 0.2 triggers retrain)

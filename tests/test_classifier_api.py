@@ -40,83 +40,68 @@ def test_readiness_ok_when_ready(client):
     assert r.json()["status"] == "ok"
 
 
-# ── /classify ─────────────────────────────────────────────────────────────────
+# ── /v1/moderations — single string input (goes through DynamicBatcher) ───────
 
 
-def test_classify_response_shape(client):
-    r = client.post("/classify", json={"text": "hello world"})
+def test_moderations_single_response_shape(client):
+    r = client.post("/v1/moderations", json={"input": "hello world"})
     assert r.status_code == 200
-    assert set(r.json().keys()) == {"label", "score", "latency_ms", "model_version", "inference_at"}
+    assert set(r.json().keys()) == {"id", "model", "results"}
+    assert len(r.json()["results"]) == 1
 
 
-def test_classify_label_is_valid(client):
-    r = client.post("/classify", json={"text": "hello world"})
-    assert r.json()["label"] in ("safe", "harm")
+def test_moderations_single_result_shape(client):
+    r = client.post("/v1/moderations", json={"input": "hello world"})
+    result = r.json()["results"][0]
+    assert set(result.keys()) == {"flagged", "categories", "category_scores"}
+    assert isinstance(result["flagged"], bool)
+    assert 0.0 <= result["category_scores"]["harm"] <= 1.0
 
 
-def test_classify_score_in_range(client):
-    r = client.post("/classify", json={"text": "hello world"})
-    assert 0.0 <= r.json()["score"] <= 1.0
-
-
-def test_classify_latency_non_negative(client):
-    r = client.post("/classify", json={"text": "hello world"})
-    assert r.json()["latency_ms"] >= 0
-
-
-def test_classify_missing_text_returns_422(client):
-    r = client.post("/classify", json={})
+def test_moderations_missing_input_returns_422(client):
+    r = client.post("/v1/moderations", json={})
     assert r.status_code == 422
 
 
-# ── /classify/batch ───────────────────────────────────────────────────────────
+# ── /v1/moderations — list input (dispatched directly, no batcher queue) ──────
 
 
-def test_batch_response_shape(client):
-    r = client.post("/classify/batch", json={"texts": ["hello", "world"]})
-    assert r.status_code == 200
-    assert set(r.json().keys()) == {
-        "results",
-        "latency_ms",
-        "batch_size",
-        "model_version",
-        "inference_at",
-    }
-
-
-def test_batch_result_count_matches_input(client):
+def test_moderations_batch_result_count_matches_input(client):
     texts = ["hello", "world", "foo"]
-    r = client.post("/classify/batch", json={"texts": texts})
-    body = r.json()
-    assert body["batch_size"] == len(texts)
-    assert len(body["results"]) == len(texts)
+    r = client.post("/v1/moderations", json={"input": texts})
+    assert r.status_code == 200
+    assert len(r.json()["results"]) == len(texts)
 
 
-def test_batch_each_result_shape(client):
-    r = client.post("/classify/batch", json={"texts": ["a", "b"]})
+def test_moderations_batch_each_result_shape(client):
+    r = client.post("/v1/moderations", json={"input": ["a", "b"]})
     for result in r.json()["results"]:
-        assert result["label"] in ("safe", "harm")
-        assert 0.0 <= result["score"] <= 1.0
+        assert isinstance(result["flagged"], bool)
+        assert 0.0 <= result["category_scores"]["harm"] <= 1.0
 
 
-def test_batch_empty_list_returns_422(client):
-    r = client.post("/classify/batch", json={"texts": []})
+def test_moderations_batch_empty_list_returns_422(client):
+    r = client.post("/v1/moderations", json={"input": []})
     assert r.status_code == 422
 
 
-def test_batch_over_max_size_returns_422(client):
-    r = client.post("/classify/batch", json={"texts": ["x"] * 65})
+def test_moderations_batch_over_max_size_returns_422(client):
+    r = client.post("/v1/moderations", json={"input": ["x"] * 65})
     assert r.status_code == 422
 
 
-def test_batch_exactly_max_size_accepted(client):
-    r = client.post("/classify/batch", json={"texts": ["x"] * 64})
+def test_moderations_batch_exactly_max_size_accepted(client):
+    r = client.post("/v1/moderations", json={"input": ["x"] * 64})
     assert r.status_code == 200
 
 
-def test_batch_missing_field_returns_422(client):
-    r = client.post("/classify/batch", json={})
-    assert r.status_code == 422
+def test_moderations_skip_persist_header_accepted(client):
+    r = client.post(
+        "/v1/moderations",
+        json={"input": "hello"},
+        headers={"X-Sentinel-Skip-Persist": "true"},
+    )
+    assert r.status_code == 200
 
 
 # ── /metrics ──────────────────────────────────────────────────────────────────

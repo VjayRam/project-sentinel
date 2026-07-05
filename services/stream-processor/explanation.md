@@ -272,7 +272,7 @@ Without signal handling, Ctrl-C raises a `KeyboardInterrupt` that would skip
 the `consumer.close()` call. Kafka would wait 30 seconds (session timeout)
 before reassigning the partitions to another consumer — making restarts slow.
 
-### `/v1/moderations`, not `/classify/batch` — dogfooding the public endpoint
+### `/v1/moderations` — dogfooding the public endpoint
 
 ```python
 resp = http.post(
@@ -284,14 +284,20 @@ resp = http.post(
 
 The stream processor calls the classifier's **OpenAI-compatible**
 `/v1/moderations` endpoint — the same one any external integration would
-use — rather than a Sentinel-internal `/classify/batch` shape. This is a
-deliberate architectural decision (see `CLAUDE.md`'s OTel GenAI semantic
-conventions section): the project's own highest-volume internal traffic
-exercises exactly the code path external callers get, instead of treating
-`/classify/batch` as the "real" endpoint and `/v1/moderations` as a thin
-facade nobody but external callers actually hits. If `/v1/moderations` ever
-broke, the stream processor's own traffic would surface it immediately in
-local dev, rather than only being caught when an external caller notices.
+use. At the time this was first built, the classifier also exposed a
+Sentinel-internal `/classify/batch` shape, and calling `/v1/moderations`
+instead was a deliberate architectural decision (see `CLAUDE.md`'s OTel
+GenAI semantic conventions section): the project's own highest-volume
+internal traffic exercised exactly the code path external callers got,
+instead of treating `/classify/batch` as the "real" endpoint and
+`/v1/moderations` as a thin facade nobody but external callers actually hit.
+`/classify` and `/classify/batch` have since been removed entirely — nothing
+ever called them except direct manual/test requests — so `/v1/moderations`
+is now simply the only classifier endpoint, but the reasoning that got there
+first is worth keeping: dogfooding the public shape meant that if
+`/v1/moderations` ever broke, the stream processor's own traffic would
+surface it immediately in local dev, rather than only being caught when an
+external caller noticed.
 
 **This decision was accidentally reverted once, mid-session, and caught by
 the user asking "isnt the /classify/batch endpoint modified to be
@@ -316,12 +322,12 @@ inherent, not incidental, and worth a name.
 field.** Without suppressing it, the classifier would also write to
 PostgreSQL asynchronously from inside `/v1/moderations` — the stream
 processor would still write its own rows too, producing duplicates. Earlier
-this was a `persist: bool` field on the request body (mirroring
-`/classify/batch`'s still-present `persist` field). It moved to a header
+this was a `persist: bool` field on the request body (mirroring the now-removed
+`/classify/batch` endpoint's `persist` field). It moved to a header
 specifically so `ModerationRequest` — the schema an external
 `openai.moderations.create()`-style caller sends — stays a clean,
 zero-Sentinel-internals OpenAI-compatible shape; see
-`services/classifier/explanation.md`'s `/v1/moderations` section for the
+`services/classifier/explanation.md`'s `moderate()` section for the
 full reasoning from the classifier side.
 
 ### Chunking to the classifier's batch limit

@@ -294,10 +294,11 @@ before setting alert thresholds.
   expr: sum(rate(classifier_requests_total[5m])) by (endpoint)
 ```
 
-`sum(...) by (endpoint)` produces one time series per endpoint label value
-(`/classify` and `/classify/batch`). This lets you see throughput split by
-endpoint, which is critical when diagnosing whether a throughput drop is from
-the single-request path or the batch path.
+`sum(...) by (endpoint)` produces one time series per endpoint label value.
+`/v1/moderations` is the only classifier endpoint (`/classify` and
+`/classify/batch` were removed — nothing called them), so today this always
+resolves to a single series; the `by (endpoint)` grouping is kept so the
+query keeps working without changes if a second endpoint is ever added.
 
 ```yaml
 - alert: ClassifierBatchBackpressure
@@ -306,13 +307,15 @@ the single-request path or the batch path.
 ```
 
 `classifier_batch_size` is a histogram of how many texts are in each
-`/classify/batch` call. The max is 64 (`MAX_BATCH_SIZE` in schemas.py). If the
-p90 is ≥60 for 5 minutes, clients are consistently pushing batches to the limit.
+list-input `/v1/moderations` call (single-string calls don't observe this
+metric — see `services/classifier/explanation.md`'s metrics.py section). The
+max is 64 (`MAX_BATCH_SIZE` in schemas.py). If the p90 is ≥60 for 5 minutes,
+clients are consistently pushing batches to the limit.
 
 This can mean two things:
 1. The stream processor is batching aggressively because it's falling behind
-   Kafka (good — it's using the batch endpoint efficiently).
-2. The service is saturated and the batch endpoint is the bottleneck.
+   Kafka (good — it's using the batch shape efficiently).
+2. The service is saturated and the batch path is the bottleneck.
 
 Look at latency alongside this alert. High batch size + low latency = healthy.
 High batch size + high latency = scale or optimize.

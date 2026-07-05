@@ -70,48 +70,15 @@ the other would have silently let requests larger than the batcher was
 tuned for pass validation, or rejected requests the batcher could have
 handled fine. One `settings.max_batch_size` value now drives both.
 
-### `ClassifyResult`
-
-```python
-class ClassifyResult(BaseModel):
-    label: str
-    score: float
-```
-
-The minimal unit of output. Defined as its own model rather than inlined into
-the response types because it appears inside both `ClassifyResponse` and
-`BatchClassifyResponse`. Duplication would create drift risk when the shape changes.
-
-### `ClassifyResponse(ClassifyResult)`
-
-Inherits `label` and `score` from `ClassifyResult`, adds `latency_ms`,
-`model_version`, and `inference_at`. Inheritance is correct here because a
-single-text response is exactly a result plus per-request metadata.
-
-### `BatchClassifyRequest`
-
-```python
-class BatchClassifyRequest(BaseModel):
-    texts: list[str] = Field(min_length=1, max_length=MAX_BATCH_SIZE)
-```
-
-In Pydantic v2, `min_length`/`max_length` on a `list` field constrain the number
-of items, not string length. Sending an empty list or more than `MAX_BATCH_SIZE`
-texts returns a 422 before any inference runs.
-
-`/classify/batch` still exists as an internal/testing endpoint, but it is
-**no longer the endpoint the stream processor calls** — see the
-`/v1/moderations` section below for why, and for how skip-persist is
-signaled now that this schema has no `persist` field at all (moved to an
-HTTP header specifically so it wouldn't need to live in a
-request body schema meant to stay OpenAI-shaped).
-
-### `BatchClassifyResponse`
-
-Returns `results` (one per input text, in the same order as the request),
-`latency_ms` (total wall time for the entire batch), `batch_size` (echo of the
-input count — lets callers verify they got a result for every input without
-counting the array), and `model_version`.
+`/classify`, `/classify/batch`, and their `ClassifyRequest`/`ClassifyResponse`/
+`ClassifyResult`/`BatchClassifyRequest`/`BatchClassifyResponse` schemas were
+removed — nothing in the system called them (the stream processor always
+called `/v1/moderations`, and no other caller existed), and `/v1/moderations`
+already accepts both a single string and a list on its own. See the
+`ModerationRequest` section below for how skip-persist is signaled now that
+no schema in this file has a `persist` field at all (moved to an HTTP header
+specifically so it wouldn't need to live in a request body schema meant to
+stay OpenAI-shaped).
 
 ---
 
@@ -142,14 +109,12 @@ Shaped to match `openai.moderations.create()`'s request/response contract
 exactly — `input` accepts either a single string or a list (mirroring the
 real API), and the response nests `categories`/`category_scores` per result
 the same way OpenAI's does, just with one category (`harm`) instead of
-OpenAI's fixed taxonomy. This is the endpoint every caller — internal
-(stream processor) and external — is meant to use going forward;
-`/classify` and `/classify/batch` remain for direct testing and backwards
-compatibility, but are not where new integration work should point. See
-`main.py`'s `moderate()` route below for why this schema deliberately has
-**no** Sentinel-internal fields (like the old `persist` flag) — a clean
-OpenAI-compatible surface with zero fields an external caller would need to
-know or care about.
+OpenAI's fixed taxonomy. This is the **only** classifier endpoint — every
+caller, internal (stream processor) and external, uses it. See `main.py`'s
+`moderate()` route below for how it branches internally on `str` vs `list`
+input, and for why this schema deliberately has **no** Sentinel-internal
+fields (like the old `persist` flag) — a clean OpenAI-compatible surface
+with zero fields an external caller would need to know or care about.
 
 ---
 
@@ -388,12 +353,15 @@ simultaneously — setup overhead (memory allocation, SIMD initialization, kerne
 scheduling) is paid once. For N=8, a single batched call typically runs 2–4×
 faster than 8 serial calls.
 
-The problem: the FastAPI `/classify` route serves one request at a time. Without
-batching, every concurrent request gets its own `session.run()` call, achieving
-the worst possible throughput.
+The problem: a single-string `/v1/moderations` call, taken on its own, would
+serve one request at a time. Without batching, every concurrent single-item
+request gets its own `session.run()` call, achieving the worst possible
+throughput.
 
 `DynamicBatcher` groups concurrent single-text requests into batches
-automatically, with no changes required to how clients call the API.
+automatically, with no changes required to how clients call the API. List
+input skips it entirely — the caller already batched its own texts, so
+`main.py` dispatches those directly instead of routing them through the queue.
 
 ### `_Pending` dataclass
 
@@ -427,10 +395,10 @@ self._queue: asyncio.Queue[_Pending] = asyncio.Queue(maxsize=settings.max_queue_
 Thread-safe within a single event loop. Route handlers (`submit()`) put items in
 via `put_nowait()`; the `_loop` coroutine drains them. The queue is **bounded**
 (`MAX_QUEUE_DEPTH`, default `1000`, from `config.settings`) — `put_nowait()`
-raises `asyncio.QueueFull` once it's full, which `main.py`'s `/classify` route
-catches and turns into an HTTP 503 ("classifier queue full — retry later")
-instead of accepting unbounded work and running the pod out of memory under
-sustained overload.
+raises `asyncio.QueueFull` once it's full, which `main.py`'s `_moderate_single()`
+helper (the single-string branch of `/v1/moderations`) catches and turns into
+an HTTP 503 ("classifier queue full — retry later") instead of accepting
+unbounded work and running the pod out of memory under sustained overload.
 
 ### `_loop()` — the batching algorithm
 
@@ -533,24 +501,25 @@ drain below could race with `_loop()` still touching the same queue.
 before closing the DB pool for exactly this reason — see `main.py`'s
 lifespan section below.
 
-### All three routes are `async def` — including `/v1/moderations`
+### `/v1/moderations` is `async def` and branches internally on input shape
 
-`/classify`, `/classify/batch`, and `/v1/moderations` are all declared
-`async def`. This might look like it contradicts the root `CLAUDE.md`'s
-"classifier design rules" note about sync routes for blocking calls — it
-doesn't, because none of these routes call `session.run()` directly inline.
-The distinction is what each does inside:
+`/v1/moderations` is declared `async def`. This might look like it
+contradicts the root `CLAUDE.md`'s "classifier design rules" note about sync
+routes for blocking calls — it doesn't, because neither branch inside it
+calls `session.run()` directly inline. The distinction is what each branch
+does:
 
-- `/classify` awaits `_batcher.submit()` — a coroutine that puts one item in the
-  queue and waits for its Future. No blocking I/O directly; the actual ORT
-  call happens inside `batcher.py`'s `_loop()`, itself offloaded via
-  `run_in_executor`.
-- `/classify/batch` and `/v1/moderations` both go through the shared
-  `_classify_and_persist()` helper (see `main.py` below), which calls
-  `loop.run_in_executor(None, _classifier.predict, texts)` — offloads the
-  blocking ORT call to a thread and awaits the result.
+- **Single string** (`isinstance(request.input, str)`) — `_moderate_single()`
+  awaits `_batcher.submit()`, a coroutine that puts one item in the queue and
+  waits for its Future. No blocking I/O directly; the actual ORT call happens
+  inside `batcher.py`'s `_loop()`, itself offloaded via `run_in_executor`.
+- **List** — goes through `_classify_and_persist()` (see `main.py` below),
+  which calls `loop.run_in_executor(None, _classifier.predict, texts)` —
+  offloads the blocking ORT call to a thread and awaits the result directly,
+  since the caller already batched its own texts and there's nothing to
+  coalesce with concurrent requests.
 
-Both approaches keep the event loop unblocked during inference. The key rule:
+Both branches keep the event loop unblocked during inference. The key rule:
 **never call a blocking C function directly in an `async def` function without
 `run_in_executor`** — an `async def` route is safe as long as every blocking
 call inside it is wrapped this way; it's not the `async def` itself that
@@ -788,7 +757,9 @@ Counter("classifier_requests_total", ..., ["endpoint", "label"])
 ```
 
 Two label dimensions:
-- `endpoint`: `"classify"`, `"classify_batch"`, or `"moderations"` — which path received the request
+- `endpoint`: always `"moderations"` now (`/v1/moderations` is the only classifier
+  endpoint) — kept as a label rather than dropped so the metric survives if a
+  second endpoint is ever added later
 - `label`: `"safe"` or `"harm"` — classification outcome
 
 Useful PromQL:
@@ -822,10 +793,10 @@ up in the `+Inf` bucket.
 Histogram("classifier_batch_size", ..., buckets=[1, 2, 4, 8, 16, 32, 64])
 ```
 
-Tracks the size of each `/classify/batch` call (the external HTTP batch, not
-the dynamic batcher's internal batches). Powers-of-2 buckets match ML workload
-patterns where clients tend to double their batch sizes rather than increase
-linearly.
+Tracks the size of each list-input `/v1/moderations` call (the external HTTP
+batch, not the dynamic batcher's internal batches — single-string calls never
+observe this metric). Powers-of-2 buckets match ML workload patterns where
+clients tend to double their batch sizes rather than increase linearly.
 
 A p90 near 64 signals the service is at capacity — clients are consistently
 hitting the maximum. The `ClassifierBatchBackpressure` alert in Prometheus rules
@@ -962,7 +933,7 @@ Prometheus scrape config uses `metrics_path: /metrics/` (trailing slash) — Fas
 redirects `/metrics` → `/metrics/`. Specifying the final path avoids the redirect
 round-trip on every scrape.
 
-### `_classify_and_persist()` — shared by `/classify/batch` and `/v1/moderations`
+### `_classify_and_persist()` — the list-input path of `moderate()`
 
 ```python
 async def _classify_and_persist(texts, endpoint, persist) -> tuple[list[dict], float, datetime]:
@@ -986,25 +957,56 @@ async def _classify_and_persist(texts, endpoint, persist) -> tuple[list[dict], f
     return results, latency_ms, inference_at
 ```
 
-Extracted once both `/classify/batch` and `/v1/moderations` needed
-"run inference off the event loop, record per-endpoint metrics, fire off
-persistence" — before this existed the two routes duplicated that whole
-sequence, and the metrics/persistence logic had already started drifting
-slightly between the copies. `endpoint` is passed through so
-`REQUEST_COUNT`/`REQUEST_LATENCY` still get the right label
-(`"classify_batch"` vs `"moderations"`) even though the underlying work is
-identical.
+Handles "run inference off the event loop, record per-endpoint metrics, fire
+off persistence" for `moderate()`'s list-input branch. `endpoint` is passed
+through as `"moderations"` — kept as a parameter rather than hardcoded so
+`REQUEST_COUNT`/`REQUEST_LATENCY` still take a label, even though today only
+one caller ever passes it.
 
 **`_persist_tasks: set[asyncio.Task]`** — every fire-and-forget persistence
-task (from `/classify`, `/classify/batch`, and `/v1/moderations` alike) is
-added to this module-level set and removed via `task.add_done_callback(_persist_tasks.discard)`
-once it finishes. This exists so `lifespan`'s shutdown sequence can
+task (from both the single-string and list branches of `/v1/moderations`)
+is added to this module-level set and removed via
+`task.add_done_callback(_persist_tasks.discard)` once it finishes. This
+exists so `lifespan`'s shutdown sequence can
 `await asyncio.gather(*_persist_tasks, return_exceptions=True)` before
 closing the DB pool — without tracking these tasks, a classification
 written in the last few requests before shutdown could still be
 mid-flight when the pool closed underneath it, silently dropping that row.
 
-### `/v1/moderations` — the primary endpoint, and how it skips persistence
+### `_moderate_single()` — the single-string path of `moderate()`
+
+```python
+async def _moderate_single(text: str, persist: bool) -> dict:
+    t0 = time.perf_counter()
+    try:
+        result = await _batcher.submit(text)
+    except asyncio.QueueFull:
+        raise HTTPException(status_code=503, detail="classifier queue full — retry later")
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    inference_at = datetime.now(timezone.utc)
+
+    REQUEST_COUNT.labels(endpoint="moderations", label=result["label"]).inc()
+    REQUEST_LATENCY.labels(endpoint="moderations").observe(latency_ms / 1000)
+
+    if _pool and persist:
+        task = asyncio.create_task(_persist_single(text, result["label"], result["score"], _classifier.model_version, latency_ms, inference_at))
+        _persist_tasks.add(task)
+        task.add_done_callback(_persist_tasks.discard)
+
+    return result
+```
+
+Mirrors `_classify_and_persist()`'s job (metrics + fire-and-forget
+persistence) but for the single-item path, since that path goes through
+`_batcher.submit()` instead of a direct `run_in_executor` call and returns
+one `dict`, not a list — the two helpers can't share a body without adding a
+branch inside the shared function, so they stay separate. Not observed on
+`BATCH_SIZE` — that histogram tracks external HTTP batch sizes, and a
+single-item call has no batch size of its own to report (the actual
+dynamic-batcher batch it lands in is an internal implementation detail, not
+something this caller chose).
+
+### `moderate()` — the only classifier endpoint, and how it skips persistence
 
 ```python
 @app.post("/v1/moderations", response_model=ModerationResponse)
@@ -1012,31 +1014,36 @@ async def moderate(
     request: ModerationRequest,
     x_sentinel_skip_persist: bool = Header(False, alias="X-Sentinel-Skip-Persist"),
 ) -> ModerationResponse:
-    texts = [request.input] if isinstance(request.input, str) else list(request.input)
-    results, _, _ = await _classify_and_persist(texts, "moderations", persist=not x_sentinel_skip_persist)
+    persist = not x_sentinel_skip_persist
+    if isinstance(request.input, str):
+        results = [await _moderate_single(request.input, persist)]
+    else:
+        results, _, _ = await _classify_and_persist(list(request.input), "moderations", persist=persist)
     return ModerationResponse(...)
 ```
 
-This is the endpoint the stream processor calls (not `/classify/batch`) —
-dogfooding the same OpenAI-compatible, publicly-documented endpoint that
-any external integration would use, rather than maintaining a
-Sentinel-internal shape as the "real" one and an OpenAI-shaped one as a
-facade. See `services/stream-processor/explanation.md` for the fuller story
-of that decision and the accidental revert it survived mid-session.
+`/classify` and `/classify/batch` were removed — nothing called them, and
+this one route already covers both shapes by branching on `isinstance(request.input, str)`.
+This is also the endpoint the stream processor calls — dogfooding the same
+OpenAI-compatible, publicly-documented endpoint that any external
+integration would use, rather than maintaining a Sentinel-internal shape as
+the "real" one and an OpenAI-shaped one as a facade. See
+`services/stream-processor/explanation.md` for the fuller story of that
+decision and the accidental revert it survived mid-session.
 
 **Skip-persist via header, not a body field.** The classifier's own async
 PostgreSQL write needs to be skippable when the stream processor calls this
 endpoint — the stream processor writes to PG itself, keyed by `span_id` for
-idempotency, and would double-write otherwise. Earlier this was a `persist:
-bool` field on the request body (mirroring `/classify/batch`'s
-`BatchClassifyRequest.persist`). That was deliberately removed:
-`ModerationRequest` is meant to be a **clean OpenAI-compatible schema** —
-zero Sentinel-internal fields visible to an external caller hitting this
-endpoint directly (a real `openai.moderations.create()`-style client should
-never need to know or care about Sentinel's internal persistence wiring).
-`X-Sentinel-Skip-Persist` moves that internal signal to a header instead,
-which keeps the body schema honestly OpenAI-shaped while still letting the
-stream processor (an internal caller) suppress the classifier's write.
+idempotency, and would double-write otherwise. An earlier design used a
+`persist: bool` field on the request body (the removed `BatchClassifyRequest`
+had exactly this). That was deliberately dropped: `ModerationRequest` is
+meant to be a **clean OpenAI-compatible schema** — zero Sentinel-internal
+fields visible to an external caller hitting this endpoint directly (a real
+`openai.moderations.create()`-style client should never need to know or care
+about Sentinel's internal persistence wiring). `X-Sentinel-Skip-Persist`
+moves that internal signal to a header instead, which keeps the body schema
+honestly OpenAI-shaped while still letting the stream processor (an internal
+caller) suppress the classifier's write.
 
 ### Environment variables summary
 
@@ -1056,4 +1063,4 @@ centralized there rather than read ad hoc in each module.
 | `ORT_INTRA_THREADS` | `4` | CPU threads per ORT matrix op |
 | `MAX_BATCH_SIZE` | `64` | Max texts per dynamic batch |
 | `MAX_WAIT_MS` | `10` | Max ms to wait filling a batch |
-| `MAX_QUEUE_DEPTH` | `1000` | Max pending requests before `/classify` returns 503 |
+| `MAX_QUEUE_DEPTH` | `1000` | Max pending requests before a single-string `/v1/moderations` call returns 503 |

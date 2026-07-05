@@ -15,11 +15,6 @@ from metrics import BATCH_SIZE, REQUEST_COUNT, REQUEST_LATENCY, attach_log_handl
 from model import Classifier
 from prometheus_client import make_asgi_app
 from schemas import (
-    BatchClassifyRequest,
-    BatchClassifyResponse,
-    ClassifyRequest,
-    ClassifyResponse,
-    ClassifyResult,
     ModerationCategories,
     ModerationCategoryScores,
     ModerationRequest,
@@ -188,9 +183,9 @@ async def _persist_batch(records: list[tuple]) -> None:
 async def _classify_and_persist(
     texts: list[str], endpoint: str, persist: bool
 ) -> tuple[list[dict], float, datetime]:
-    """Shared by classify_batch() and moderate(): run inference off the event
-    loop, record per-endpoint metrics, and fire off persistence. Callers just
-    shape their own response from the (results, latency_ms, inference_at).
+    """Used by moderate() for list input: run inference off the event loop
+    via a single direct run_in_executor dispatch (the caller already batched
+    its own texts), record per-endpoint metrics, and fire off persistence.
     """
     t0 = time.perf_counter()
     loop = asyncio.get_running_loop()
@@ -215,23 +210,26 @@ async def _classify_and_persist(
     return results, latency_ms, inference_at
 
 
-@app.post("/classify", response_model=ClassifyResponse)
-async def classify(request: ClassifyRequest) -> ClassifyResponse:
+async def _moderate_single(text: str, persist: bool) -> dict:
+    """Single-string input path: goes through DynamicBatcher so concurrent
+    single-item /v1/moderations calls still get coalesced into one ORT call
+    per batch, instead of one run_in_executor dispatch per request.
+    """
     t0 = time.perf_counter()
     try:
-        result = await _batcher.submit(request.text)
+        result = await _batcher.submit(text)
     except asyncio.QueueFull:
         raise HTTPException(status_code=503, detail="classifier queue full — retry later")
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
     inference_at = datetime.now(timezone.utc)
 
-    REQUEST_COUNT.labels(endpoint="classify", label=result["label"]).inc()
-    REQUEST_LATENCY.labels(endpoint="classify").observe(latency_ms / 1000)
+    REQUEST_COUNT.labels(endpoint="moderations", label=result["label"]).inc()
+    REQUEST_LATENCY.labels(endpoint="moderations").observe(latency_ms / 1000)
 
-    if _pool:
+    if _pool and persist:
         task = asyncio.create_task(
             _persist_single(
-                request.text,
+                text,
                 result["label"],
                 result["score"],
                 _classifier.model_version,
@@ -242,26 +240,7 @@ async def classify(request: ClassifyRequest) -> ClassifyResponse:
         _persist_tasks.add(task)
         task.add_done_callback(_persist_tasks.discard)
 
-    return ClassifyResponse(
-        latency_ms=latency_ms,
-        model_version=_classifier.model_version,
-        inference_at=inference_at.isoformat(),
-        **result,
-    )
-
-
-@app.post("/classify/batch", response_model=BatchClassifyResponse)
-async def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse:
-    results, latency_ms, inference_at = await _classify_and_persist(
-        request.texts, "classify_batch", request.persist
-    )
-    return BatchClassifyResponse(
-        results=[ClassifyResult(**r) for r in results],
-        latency_ms=latency_ms,
-        batch_size=len(request.texts),
-        model_version=_classifier.model_version,
-        inference_at=inference_at.isoformat(),
-    )
+    return result
 
 
 @app.post("/v1/moderations", response_model=ModerationResponse)
@@ -274,17 +253,26 @@ async def moderate(
     Accepts a single string or a list of strings and returns one ModerationResult
     per input in the same order. Drop-in compatible with openai.moderations.create().
 
-    The stream processor calls this endpoint too (not /classify/batch) so
-    internal traffic exercises the same code path production callers use.
-    It skips classifier-side persistence via the X-Sentinel-Skip-Persist
-    header (it writes to PG itself, with span_id for idempotency) rather
-    than a body field — ModerationRequest stays a clean OpenAI-compatible
-    schema with no Sentinel-internal fields visible to external callers.
+    This is the only classifier endpoint — the stream processor calls it too,
+    so internal traffic exercises the same code path external callers use.
+    A single-string input is queued through DynamicBatcher (coalesces
+    concurrent single-item calls into one ORT call per batch); a list input
+    is already batched by the caller, so it's dispatched directly via
+    run_in_executor. Either way session.run() never runs inline on the
+    event loop. Persistence is skipped via the X-Sentinel-Skip-Persist
+    header (the stream processor writes to PG itself, with span_id for
+    idempotency) rather than a body field — ModerationRequest stays a clean
+    OpenAI-compatible schema with no Sentinel-internal fields visible to
+    external callers.
     """
-    texts = [request.input] if isinstance(request.input, str) else list(request.input)
-    results, _, _ = await _classify_and_persist(
-        texts, "moderations", persist=not x_sentinel_skip_persist
-    )
+    persist = not x_sentinel_skip_persist
+
+    if isinstance(request.input, str):
+        results = [await _moderate_single(request.input, persist)]
+    else:
+        results, _, _ = await _classify_and_persist(
+            list(request.input), "moderations", persist=persist
+        )
 
     return ModerationResponse(
         id=f"modr-{uuid.uuid4().hex[:12]}",

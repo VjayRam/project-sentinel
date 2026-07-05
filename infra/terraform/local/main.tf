@@ -1675,6 +1675,20 @@ resource "kubernetes_deployment" "classifier" {
               }
             }
           }
+          env {
+            # Default (4) is tuned for single-request low latency, but this
+            # pod is capped at cpu: 1000m — under concurrent load, each
+            # request's own 4-thread intra-op call contends with every other
+            # concurrent request for the same single core, and that
+            # contention (not queueing) was the dominant cost measured in
+            # docs/load-test-report.md (list-path p50 latency: 1.9s -> 8.2s
+            # from concurrency 1 -> 5, with throughput flat around 19
+            # items/sec the whole time). Set to 1 per CLAUDE.md's documented
+            # "flip to intra=1, inter=N for concurrent workloads" guidance —
+            # see docs/load-test-report-intra1.md for the measured before/after.
+            name  = "ORT_INTRA_THREADS"
+            value = "1"
+          }
 
           port { container_port = 8000 }
 

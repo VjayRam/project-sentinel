@@ -199,12 +199,12 @@ def run() -> None:
                 for i in range(0, len(texts), CLASSIFY_CHUNK_SIZE)
             ]
 
-            # Calls /v1/moderations (not /classify/batch) deliberately — this
-            # is the same OpenAI-compatible endpoint external callers use, so
-            # our own highest-volume internal traffic exercises that exact
-            # code path (see CLAUDE.md's OTel GenAI conventions section).
-            # X-Sentinel-Skip-Persist replaces the classifier's own PG write:
-            # we write here ourselves with span_id for idempotency.
+            # Calls /v1/moderations — the same OpenAI-compatible endpoint
+            # external callers use, so our own highest-volume internal
+            # traffic exercises that exact code path (see CLAUDE.md's OTel
+            # GenAI conventions section). X-Sentinel-Skip-Persist replaces
+            # the classifier's own PG write: we write here ourselves with
+            # span_id for idempotency.
             all_results: list[dict] = []
             classify_ms_total = 0.0
             model_version = ""

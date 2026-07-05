@@ -243,6 +243,34 @@ Model upgrades always go through a rolling restart — there's no `/reload` endp
 - **Promotion requires a human-labelled ground truth** — the model's own predictions are never used to train itself; `flagged_content` is reviewed and labelled by an operator in `services/label-ui` before it becomes training data.
 - **Automated retrains are still quality-gated** — a drift-triggered retrain that regresses accuracy relative to the currently active model is rejected before promotion, the same as a manually-triggered one.
 
+## Load testing
+
+The classifier was load- and stress-tested against its two `/v1/moderations` dispatch paths — single-string input (queued through `DynamicBatcher`) and list input (dispatched directly via `run_in_executor`) — using a custom async Python harness (httpx + asyncio, no external tool needed), ramping concurrency per stage until latency/error degradation was observed. Pod resource usage (CPU/memory) was sampled concurrently via `kubectl top pod`.
+
+**Setup:** 1 classifier replica, resource limits `cpu: 1000m` / `memory: 1Gi` (k3d, local).
+
+**Baseline (`ORT_INTRA_THREADS=4`, the single-request-tuned default):**
+
+| Path | Concurrency | Throughput | p50 | p99 |
+|---|---|---|---|---|
+| Single-string | 1 → 10 | 13.1 → 15.3 req/s (flat) | 94.7ms → 641.8ms | 101.7ms → 899.7ms |
+| List (32-item batches) | 1 → 5 | 17.0 → 19.5 items/s (flat) | 1.9s → 8.2s | 2.0s → 10.4s |
+
+Throughput plateaued while latency kept climbing — a queueing/contention signature, not a request failure (0% errors throughout). Root cause: the pod's CPU **limit** (1 core) is *below* `ORT_INTRA_THREADS`'s thread count (4), so every request — concurrent or not — pays Kubernetes CFS quota-throttling overhead rather than getting real 4-way parallelism. CPU peaked at 1011m (at the 1000m limit) and memory peaked at 1019Mi (near the 1024Mi limit) during the worst stages.
+
+**Fix and re-test (`ORT_INTRA_THREADS=1`):** applied as a Terraform env var change (`infra/terraform/local/main.tf`), rebuilt, rolled out, and re-tested identically:
+
+| Path | Concurrency | Throughput vs. baseline | p50 vs. baseline |
+|---|---|---|---|
+| Single-string | 1 | 26.1 req/s (**+99%**) | 36.9ms (**-61%**) |
+| Single-string | 10 | 36.3 req/s (**+137%**) | 284.3ms (**-56%**) |
+| List (32-item batches) | 1 | 32.6 items/s (**+92%**) | 960.6ms (**-49%**) |
+| List (32-item batches) | 5 | 23.4 items/s (**+20%**) | 6.7s (**-18%**) |
+
+Not a tradeoff — `intra=1` won at every concurrency level on both paths, including concurrency=1 with zero contention. Average CPU utilization during the test nearly tripled (212m → 545m), confirming the mechanism: under `intra=4`, most of the CPU quota was being burned on thread-scheduling overhead rather than inference; `intra=1` has no thread/quota mismatch to throttle. Peak memory was essentially unchanged (~1017-1019Mi either way) — the near-OOM risk is a separate, still-open issue (batch tensor size), not something this fix addresses.
+
+Full methodology, per-stage percentile tables, and resume-ready framing: [`docs/load-test-report.md`](docs/load-test-report.md) (baseline) and [`docs/load-test-report-intra1.md`](docs/load-test-report-intra1.md) (fix + comparison).
+
 ## Tech stack
 
 | Concern | Tool |
@@ -267,3 +295,4 @@ Model upgrades always go through a rolling restart — there's no `/reload` endp
 - Every directory listed under **Project structure** above has its own `explanation.md` — the deepest, most accurate source for how any given piece works and why.
 - [`docs/local-dev.md`](docs/local-dev.md) — a granular service-by-service reference (ports, sample queries, manual port-forward commands). **Note:** written during Phase 5 and not yet updated for Phases 6–7 (drift/orchestration/MLflow/label-ui) — treat the per-service sections for Phases 1–5 as accurate and the rest as pending a refresh.
 - [`ISSUES.md`](ISSUES.md) — a production-readiness audit; note it also predates some of the fixes already made (e.g. the classifier Dockerfile it flags as missing exists now) — read it as a snapshot in time, not a current gap list.
+- [`docs/load-test-report.md`](docs/load-test-report.md) and [`docs/load-test-report-intra1.md`](docs/load-test-report-intra1.md) — classifier load/stress test methodology, results, and a measured before/after on an ORT thread-tuning fix.
