@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sentinel — Content Safety Monitoring for LLM Applications</title>
+<meta name="description" content="Sentinel classifies every prompt and completion your LLM app sends, watches for input drift, and retrains itself automatically when the distribution moves." />
+<link rel="icon" href="favicon.ico" sizes="any" />
+<link rel="icon" type="image/png" href="favicon-32.png" sizes="32x32" />
+<link rel="icon" type="image/png" href="favicon-16.png" sizes="16x16" />
+<link rel="icon" type="image/png" href="favicon-192.png" sizes="192x192" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<header class="site-header">
+  <a class="brand" href="#top">
+    <img src="../assets/sentinel-logo.png" alt="" />
+    Sentinel
+  </a>
+  <nav class="site-nav">
+    <a href="#flow">How it works</a>
+    <a href="#metrics">Metrics</a>
+    <a href="#stack">Stack</a>
+    <a href="#setup">Setup</a>
+    <button class="theme-toggle" id="theme-toggle" title="Toggle theme" aria-label="Toggle color theme">◐</button>
+    <a class="btn btn-ghost" href="https://github.com/VjayRam/project-sentinel" target="_blank" rel="noopener">GitHub ↗</a>
+  </nav>
+</header>
+
+<section class="hero" id="top">
+  <canvas class="hero-scope" id="hero-scope" aria-hidden="true"></canvas>
+  <div class="hero-inner">
+    <p class="eyebrow">Content safety monitoring for LLM applications</p>
+    <h1>Every prompt.<br>Every reply.<br><span>Watched.</span></h1>
+    <p class="hero-sub">
+      Sentinel sits behind your chat app, classifies every prompt and completion
+      for harm, detects when the model's input distribution drifts from what it
+      was trained on, and retrains + redeploys a new model version before that
+      drift becomes an incident.
+    </p>
+    <div class="hero-ctas">
+      <a class="btn btn-primary" href="#setup">Set it up on Linux →</a>
+      <a class="btn btn-ghost" href="https://github.com/VjayRam/project-sentinel" target="_blank" rel="noopener">Read the source</a>
+    </div>
+    <div class="status-strip mono">
+      <span><span class="dot dot-safe"></span>classifications flowing</span>
+      <span><span class="dot dot-accent"></span>PSI &gt; 0.2 triggers retrain</span>
+      <span><span class="dot dot-harm"></span>quality-gated promotion</span>
+    </div>
+  </div>
+</section>
+
+<section id="flow">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Data flow</p>
+      <h2>One signal chain, start to finish</h2>
+      <p>A chat app is treated as an external black box — Sentinel never touches its prompts directly. It only sees what arrives as OpenTelemetry telemetry.</p>
+    </div>
+
+    <div class="chain">
+      <div class="chain-node">
+        <span class="n">01 · SOURCE</span>
+        <h3>Chat app</h3>
+        <p>Emits OTel spans over OTLP/gRPC on <code class="mono">:4317</code>. Prompt/response text travels in span <em>events</em>, not attributes, per the GenAI semantic conventions.</p>
+      </div>
+      <div class="chain-arrow">→</div>
+      <div class="chain-node">
+        <span class="n">02 · COLLECT</span>
+        <h3>OTel Collector</h3>
+        <p>Fans every trace out to Kafka and to Jaeger for live inspection.</p>
+      </div>
+      <div class="chain-arrow">→</div>
+      <div class="chain-node">
+        <span class="n">03 · STREAM</span>
+        <h3>Kafka · traces.raw</h3>
+        <p>3 partitions. A Python consumer extracts prompt/response text from each span.</p>
+      </div>
+      <div class="chain-arrow">→</div>
+      <div class="chain-node">
+        <span class="n">04 · SCORE</span>
+        <h3>Classifier</h3>
+        <p><code class="mono">POST /v1/moderations</code> — ONNX INT8 RoBERTa, OpenAI-moderation-compatible.</p>
+      </div>
+      <div class="chain-arrow">→</div>
+      <div class="chain-node">
+        <span class="n">05 · PERSIST</span>
+        <h3>Postgres + Mongo</h3>
+        <p>Every score to <code class="mono">classifications</code>; harmful content (+10% of safe) to <code class="mono">flagged_content</code>.</p>
+      </div>
+      <div class="chain-arrow">→</div>
+      <div class="chain-node">
+        <span class="n">06 · REACT</span>
+        <h3>Drift + retrain</h3>
+        <p>Hourly PSI/JSD check against a reference window; a breach fine-tunes, quality-gates, and rolling-restarts.</p>
+      </div>
+
+      <div class="chain-branch">
+        <strong>Human in the loop:</strong>
+        <span>flagged content is reviewed and labelled in the Label UI before it ever becomes training data — the model never trains on its own predictions.</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="demo">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">See it running</p>
+      <h2>Traces landing end to end</h2>
+      <p>Simulated chat traffic flowing through the full local stack — collector, Kafka, classifier, Postgres/Mongo, Jaeger.</p>
+    </div>
+    <div class="scope-frame">
+      <div class="bezel-bar">
+        <span class="led"></span>
+        <span>SENTINEL // LOCAL-DEV // k3d</span>
+      </div>
+      <img src="../assets/sentinel-video.gif" alt="Screen recording of the Sentinel stack processing simulated traces end to end" loading="lazy" />
+    </div>
+  </div>
+</section>
+
+<section id="impact">
+  <div class="wrap">
+    <div class="impact-head">
+      <p class="eyebrow">Load-tested, not assumed</p>
+      <p class="impact-note">One config change — <span class="mono">ORT_INTRA_THREADS</span> 4 → 1 — measured before/after on the same 1-vCPU-limited classifier pod.</p>
+    </div>
+    <div class="impact-strip">
+      <div class="impact-stat">
+        <span class="impact-num mono">+137<small>%</small></span>
+        <span class="impact-label">throughput</span>
+        <span class="impact-ctx">single-string path, concurrency 10 — 15.3 → 36.3 req/s</span>
+      </div>
+      <div class="impact-stat">
+        <span class="impact-num mono">−60<small>%</small></span>
+        <span class="impact-label">p99 latency</span>
+        <span class="impact-ctx">same test — 899.7ms → 361.5ms</span>
+      </div>
+      <div class="impact-stat">
+        <span class="impact-num mono">+92<small>%</small></span>
+        <span class="impact-label">throughput</span>
+        <span class="impact-ctx">32-item batch path, concurrency 1 — 17.0 → 32.6 items/s</span>
+      </div>
+      <div class="impact-stat">
+        <span class="impact-num mono">2.6<small>×</small></span>
+        <span class="impact-label">CPU actually working</span>
+        <span class="impact-ctx">avg utilization during test — 212m → 545m core</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="metrics">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Metrics</p>
+      <h2>What actually got measured</h2>
+      <p>Real numbers from the model optimization pipeline, a load/stress test against a single 1-vCPU pod, the live Prometheus surface, and the gates that decide whether a retrained model ships.</p>
+    </div>
+
+    <div class="metric-grid">
+
+      <div class="panel">
+        <h3>Model optimization pipeline</h3>
+        <table>
+          <thead><tr><th>Stage</th><th>Size</th><th>p50 latency</th></tr></thead>
+          <tbody>
+            <tr><td>PyTorch FP32</td><td>~500 MB</td><td>~110 ms</td></tr>
+            <tr><td>ONNX + O2 graph opt</td><td>~480 MB</td><td>~60 ms</td></tr>
+            <tr><td>ONNX + INT8 quant</td><td>~120 MB</td><td>~35 ms</td></tr>
+          </tbody>
+        </table>
+        <div class="callout"><strong>~75% smaller, ~3x faster</strong> — dynamic INT8 quantization, activations quantized at runtime, no calibration dataset needed, &lt;0.2% accuracy cost.</div>
+      </div>
+
+      <div class="panel">
+        <h3>Load test — single-string path</h3>
+        <table>
+          <thead><tr><th>Concurrency</th><th>Throughput</th><th>p50</th><th>p99</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>26.1 req/s</td><td>36.9 ms</td><td>—</td></tr>
+            <tr><td>5</td><td>34.5 req/s</td><td>149.0 ms</td><td>—</td></tr>
+            <tr><td>10</td><td>36.3 req/s</td><td>284.3 ms</td><td>361.5 ms</td></tr>
+          </tbody>
+        </table>
+        <div class="callout">1 replica, <span class="mono">cpu: 1000m / memory: 1Gi</span>, after tuning <span class="mono">ORT_INTRA_THREADS=1</span> for concurrent load — <strong>+99–137% throughput, −56–61% latency</strong> vs. the single-request-tuned default of 4 threads on the same pod.</div>
+      </div>
+
+      <div class="panel">
+        <h3>Load test — batch path (32-item lists)</h3>
+        <table>
+          <thead><tr><th>Concurrency</th><th>Throughput</th><th>p50</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>32.6 items/s</td><td>960.6 ms</td></tr>
+            <tr><td>2</td><td>28.8 items/s</td><td>2.19 s</td></tr>
+            <tr><td>5</td><td>23.4 items/s</td><td>6.71 s</td></tr>
+          </tbody>
+        </table>
+        <div class="callout">Throughput barely moves while latency scales with concurrency — <strong>a real CPU ceiling</strong>, confirmed by <span class="mono">kubectl top pod</span> hitting 996–1011m against the 1000m limit during every degraded stage.</div>
+      </div>
+
+      <div class="panel">
+        <h3>Drift &amp; promotion gates</h3>
+        <div class="gate-threshold"><span class="big mono">0.2</span><span class="lbl">PSI above this, hourly, auto-triggers a retrain</span></div>
+        <div class="stat-row"><span class="k">Drift metrics</span><span class="v">PSI (gating) · JSD (visibility)</span></div>
+        <div class="stat-row"><span class="k">Held-out evaluation set</span><span class="v">3,780 rows · 9 risk categories</span></div>
+        <div class="stat-row"><span class="k">Minimum accuracy to promote</span><span class="v accent">0.85</span></div>
+        <div class="stat-row"><span class="k">Max allowed regression vs. active model</span><span class="v accent">0.01</span></div>
+        <div class="stat-row"><span class="k">Training data source</span><span class="v">human-labelled only, never model's own output</span></div>
+      </div>
+
+      <div class="panel">
+        <h3>Prometheus surface — <span class="mono">/metrics</span></h3>
+        <ul class="metric-list">
+          <li><code>classifier_requests_total{endpoint,label}</code><span>Request count by route and predicted label</span></li>
+          <li><code>classifier_request_latency_seconds{endpoint}</code><span>Histogram, 5ms–1s buckets</span></li>
+          <li><code>classifier_batch_size</code><span>Histogram of texts per batch, 1–64</span></li>
+          <li><code>classifier_queue_depth</code><span>Gauge — requests waiting in the DynamicBatcher queue</span></li>
+          <li><code>classifier_log_errors_total{level}</code><span>ERROR+ log records emitted</span></li>
+        </ul>
+      </div>
+
+      <div class="panel">
+        <h3>Kafka &amp; storage shape</h3>
+        <div class="stat-row"><span class="k">Topic</span><span class="v">traces.raw · 3 partitions</span></div>
+        <div class="stat-row"><span class="k">Offset commit</span><span class="v">manual, after Postgres + Mongo writes</span></div>
+        <div class="stat-row"><span class="k">Idempotency key</span><span class="v">(span_id, text_type)</span></div>
+        <div class="stat-row"><span class="k">Safe-sample rate to Mongo</span><span class="v accent">10%</span></div>
+        <div class="callout">Scaling consumers beyond 3 replicas gives zero benefit — one per partition is the ceiling.</div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section id="stack">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Tech stack</p>
+      <h2>One tool per concern</h2>
+      <p>Every phase introduces exactly the tool that concern needs — nothing borrowed from a later phase.</p>
+    </div>
+
+    <div class="stack-groups">
+      <div class="stack-row"><span class="concern">Inference API</span><div class="tools"><span class="chip">FastAPI</span><span class="chip">ONNX Runtime</span></div></div>
+      <div class="stack-row"><span class="concern">Model optimization</span><div class="tools"><span class="chip">HuggingFace Optimum</span><span class="chip">ONNX Runtime</span></div></div>
+      <div class="stack-row"><span class="concern">Fine-tuning</span><div class="tools"><span class="chip">HuggingFace Transformers</span></div></div>
+      <div class="stack-row"><span class="concern">Stream processing</span><div class="tools"><span class="chip">Kafka (KRaft)</span><span class="chip">Python consumer</span></div></div>
+      <div class="stack-row"><span class="concern">Databases</span><div class="tools"><span class="chip">PostgreSQL</span><span class="chip">MongoDB</span></div></div>
+      <div class="stack-row"><span class="concern">Object storage</span><div class="tools"><span class="chip">MinIO</span></div></div>
+      <div class="stack-row"><span class="concern">Drift detection</span><div class="tools"><span class="chip">PySpark</span><span class="chip">PSI / JSD</span></div></div>
+      <div class="stack-row"><span class="concern">Orchestration</span><div class="tools"><span class="chip">Apache Airflow</span></div></div>
+      <div class="stack-row"><span class="concern">Experiment tracking</span><div class="tools"><span class="chip">MLflow</span></div></div>
+      <div class="stack-row"><span class="concern">Observability</span><div class="tools"><span class="chip">OTel Collector</span><span class="chip">Prometheus</span><span class="chip">Grafana</span><span class="chip">Jaeger</span></div></div>
+      <div class="stack-row"><span class="concern">Infrastructure</span><div class="tools"><span class="chip">Terraform</span><span class="chip">k3d</span></div></div>
+      <div class="stack-row"><span class="concern">CI/CD</span><div class="tools"><span class="chip">GitHub Actions</span><span class="chip">GHCR</span></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="phases">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Build phases</p>
+      <h2>Every phase, one at a time</h2>
+      <p>Built as a learning project — each phase fully working before the next begins. Phases 1–7 are complete; only cloud deployment remains.</p>
+    </div>
+
+    <div class="board">
+      <div class="board-row head">
+        <span>#</span>
+        <span>What gets built</span>
+        <span class="tools-h">Key tools</span>
+        <span>Status</span>
+      </div>
+      <div class="board-row"><span class="idx">01</span><span class="what">Classifier service — FastAPI + ONNX inference</span><span class="tools">FastAPI, ONNX Runtime, Prometheus client</span><span class="pill pill-done">Complete</span></div>
+      <div class="board-row"><span class="idx">02</span><span class="what">Model optimization pipeline</span><span class="tools">HF Optimum, ONNX, INT8 quantization</span><span class="pill pill-done">Complete</span></div>
+      <div class="board-row"><span class="idx">03</span><span class="what">Local infra — k3d, databases, object storage</span><span class="tools">Terraform, Helm, PostgreSQL, MongoDB, MinIO</span><span class="pill pill-done">Complete</span></div>
+      <div class="board-row"><span class="idx">04</span><span class="what">Observability stack</span><span class="tools">OTel Collector, Jaeger, Prometheus, Grafana</span><span class="pill pill-done">Complete</span></div>
+      <div class="board-row"><span class="idx">05</span><span class="what">Trace ingestion + stream processing</span><span class="tools">Kafka (Strimzi), Python consumer</span><span class="pill pill-done">Complete</span></div>
+      <div class="board-row"><span class="idx">06</span><span class="what">Drift detection</span><span class="tools">PySpark, PSI / JSD metrics</span><span class="pill pill-done">Complete</span></div>
+      <div class="board-row"><span class="idx">07</span><span class="what">Orchestration + experiment tracking</span><span class="tools">Airflow, MLflow, Label UI</span><span class="pill pill-done">Complete</span></div>
+      <div class="board-row"><span class="idx">08</span><span class="what">Cloud deployment</span><span class="tools">Terraform workspaces, EKS/GKE, RDS, S3</span><span class="pill pill-pending">Pending</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="setup">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Setup — Linux</p>
+      <h2>Run the whole stack locally</h2>
+      <p>One script brings up a k3d cluster and every service in it. This is the exact sequence to follow, in order.</p>
+    </div>
+
+    <div class="setup-steps">
+      <div class="step">
+        <span class="num">01</span>
+        <div>
+          <h3>Install prerequisites</h3>
+          <p>Everything below is available through your distro's package manager or its official installer.</p>
+          <ul class="prereqs">
+            <li>Docker</li>
+            <li>k3d</li>
+            <li>kubectl</li>
+            <li>Terraform ≥ 1.6</li>
+            <li>uv</li>
+            <li>Python 3.12 (uv manages this if it isn't installed)</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">02</span>
+        <div>
+          <h3>Clone and install dependencies</h3>
+          <p><span class="mono">uv sync</span> installs the root workspace plus the classifier's deps for local tooling.</p>
+          <pre class="code-block"><span class="c"># </span>git clone https://github.com/VjayRam/project-sentinel.git
+cd project-sentinel
+uv sync --all-packages</pre>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">03</span>
+        <div>
+          <h3>Bring up the full stack</h3>
+          <p>One script does everything: creates the k3d cluster, builds and imports every image, runs <span class="mono">terraform apply</span>, waits for readiness, unpauses both Airflow DAGs, bootstraps a model if the registry is empty, opens every port-forward, then rolling-restarts the classifier so it loads that model.</p>
+          <pre class="code-block">./scripts/dev-start.sh</pre>
+          <p style="margin-top:10px">Press <span class="mono">Ctrl-C</span> to stop cleanly — only the port-forwards stop; the k3d cluster keeps running. Re-run the script any time to reconnect.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">04</span>
+        <div>
+          <h3>Verify it's alive</h3>
+          <pre class="code-block"><span class="c"># liveness / readiness</span>
+curl http://localhost:8000/health/ready
+
+<span class="c"># send synthetic chat traffic through the real OTLP path</span>
+python scripts/simulate-traces.py --count 20 --harm-pct 0.3
+
+<span class="c"># confirm it landed</span>
+psql postgresql://sentinel:sentinel@localhost:5432/sentinel \
+  -c "SELECT label, count(*) FROM classifications GROUP BY label;"</pre>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="num">05</span>
+        <div>
+          <h3>Reach every service on localhost</h3>
+          <p>Every port below is opened automatically by <span class="mono">dev-start.sh</span> via <span class="mono">kubectl port-forward</span>.</p>
+          <div class="service-table-wrap">
+            <table class="svc">
+              <thead><tr><th>Service</th><th>URL</th><th>Credentials</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">Classifier API</td><td class="mono">localhost:8000</td><td class="dim">—</td></tr>
+                <tr><td class="mono">Classifier docs</td><td class="mono">localhost:8000/docs</td><td class="dim">—</td></tr>
+                <tr><td class="mono">Label UI</td><td class="mono">localhost:8001</td><td class="dim">—</td></tr>
+                <tr><td class="mono">Grafana</td><td class="mono">localhost:3000</td><td class="dim">admin / admin</td></tr>
+                <tr><td class="mono">Prometheus</td><td class="mono">localhost:9090</td><td class="dim">—</td></tr>
+                <tr><td class="mono">Jaeger UI</td><td class="mono">localhost:16686</td><td class="dim">—</td></tr>
+                <tr><td class="mono">Airflow UI</td><td class="mono">localhost:8090</td><td class="dim">admin / sentinel</td></tr>
+                <tr><td class="mono">MLflow UI</td><td class="mono">localhost:5000</td><td class="dim">—</td></tr>
+                <tr><td class="mono">MinIO console</td><td class="mono">localhost:9001</td><td class="dim">sentinel / sentinel-minio</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <span class="fmark">Sentinel</span>
+  <nav class="flinks">
+    <a href="https://github.com/VjayRam/project-sentinel" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://github.com/VjayRam/project-sentinel/blob/master/docs/local-dev.md" target="_blank" rel="noopener">Local dev reference</a>
+    <a href="https://github.com/VjayRam/project-sentinel/blob/master/ISSUES.md" target="_blank" rel="noopener">Production-readiness audit</a>
+    <a href="https://github.com/VjayRam/project-sentinel/blob/master/CLAUDE.md" target="_blank" rel="noopener">Architecture notes</a>
+  </nav>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
