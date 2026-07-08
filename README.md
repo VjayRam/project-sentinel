@@ -63,7 +63,8 @@ sentinel/
     terraform/local/      — the entire local k3d stack, declared in Terraform
     mlflow/, prometheus/, grafana/ — Dockerfiles and config for those services
   datasets/               — held-out evaluation set (test_dataset.csv) + loader
-  scripts/                — dev-start.sh (full stack bring-up), simulate-traces.py
+  scripts/                — dev-start.sh (full stack bring-up), simulate-traces.py (quick smoke test),
+                            simulate-traces-prod.py (production-shaped load: 1000s of spans/sec, drift ramp)
   docs/                   — local-dev reference (see note below — due for a refresh)
   tests/                  — classifier API tests (mocked, no model/cluster needed)
 ```
@@ -147,6 +148,14 @@ python scripts/simulate-traces.py --count 20 --harm-pct 0.3
 ```
 
 Emits synthetic OTLP traces through the same collector path a real chat app would use. Watch them land end-to-end:
+
+For production-scale load — thousands of spans in seconds, weighted model mix, multi-turn sessions, realistic latency, and an optional ramping-harm-pct mode to actually exercise drift detection — use `simulate-traces-prod.py` instead:
+
+```bash
+python scripts/simulate-traces-prod.py --count 5000 --rps 400 --concurrency 100
+python scripts/simulate-traces-prod.py --duration 60 --rps 50 --pattern diurnal
+python scripts/simulate-traces-prod.py --count 3000 --drift-harm 0.05:0.6
+```
 
 ```bash
 # Classifications in Postgres

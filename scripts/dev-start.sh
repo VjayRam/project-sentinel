@@ -113,9 +113,11 @@ info "Label-UI image imported"
 # Build context is the repo root, not pipelines/retraining/ — pipeline.py
 # imports pipelines.optimizer, pipelines.evaluation, and datasets.eval_holdout
 # (transitively via benchmark.py) directly, so all three trees need to be in
-# the build context. This one takes a while (torch + transformers).
+# the build context. This one takes a while (torch + transformers) and has
+# timed out on slow networks before (see pipelines/retraining/Dockerfile) —
+# --quiet dropped here so progress is visible instead of looking hung.
 info "Building retraining image (this can take a few minutes)..."
-docker build -f "$REPO_ROOT/pipelines/retraining/Dockerfile" -t sentinel-retraining:local "$REPO_ROOT" --quiet
+docker build -f "$REPO_ROOT/pipelines/retraining/Dockerfile" -t sentinel-retraining:local "$REPO_ROOT"
 k3d image import sentinel-retraining:local -c "$CLUSTER" 2>/dev/null
 info "Retraining image imported"
 
@@ -416,6 +418,7 @@ echo "  PostgreSQL       →  localhost:5432  (sentinel / sentinel)"
 echo "  MongoDB          →  localhost:27017 (sentinel / sentinel)"
 echo ""
 echo "  Simulate traces: python scripts/simulate-traces.py"
+echo "  Load test:       python scripts/simulate-traces-prod.py --count 5000 --rps 400"
 echo "  Stream logs:     kubectl logs -f -n sentinel-app deploy/stream-processor"
 echo "  Classifier logs: kubectl logs -f -n sentinel-app deploy/classifier"
 echo "  Rebuild images:  re-run ./scripts/dev-start.sh"

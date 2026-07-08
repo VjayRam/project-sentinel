@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Build context MUST be the repo root, not this directory — unlike drift/'s
 # self-contained Dockerfile, pipeline.py imports pipelines.optimizer,
 # pipelines.evaluation, and datasets.eval_holdout (transitively, via
@@ -13,7 +14,15 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # passthrough configured (adding it was out of scope for this phase; see
 # pipelines/retraining/explanation.md). Installing the default (CUDA) wheel
 # here would pull in ~2GB of CUDA runtime this pod can never use.
-RUN uv venv /app/.venv && \
+#
+# torch's wheel alone is ~183MB; on a slow/flaky link uv's default 30s idle
+# timeout trips mid-download and the whole layer fails with "network
+# timeout" (live-verified — see git history). UV_HTTP_TIMEOUT raises that
+# budget, and the cache mount means a retried build resumes from
+# already-downloaded wheels instead of starting over from zero.
+ENV UV_HTTP_TIMEOUT=300
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv /app/.venv && \
     uv pip install --python /app/.venv/bin/python \
         --index-url https://download.pytorch.org/whl/cpu \
         "torch>=2.2" && \
