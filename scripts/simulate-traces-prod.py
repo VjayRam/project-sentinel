@@ -72,54 +72,116 @@ SAFE_TOPICS: dict[str, list[tuple[str, str]]] = {
     "geography": [
         ("What is the capital of France?", "Paris is the capital of France."),
         ("What is the tallest mountain in the world?", "Mount Everest, at 8,849 meters."),
-        ("Which country has the most timezones?", "France, with 12, due to its overseas territories."),
+        (
+            "Which country has the most timezones?",
+            "France, with 12, due to its overseas territories.",
+        ),
     ],
     "science": [
-        ("Explain how photosynthesis works.", "Photosynthesis is the process by which plants convert sunlight into energy."),
-        ("Why is the sky blue?", "Rayleigh scattering — shorter blue wavelengths scatter more than red ones."),
-        ("What causes tides?", "The gravitational pull of the moon and, to a lesser extent, the sun."),
+        (
+            "Explain how photosynthesis works.",
+            "Photosynthesis is the process by which plants convert sunlight into energy.",
+        ),
+        (
+            "Why is the sky blue?",
+            "Rayleigh scattering — shorter blue wavelengths scatter more than red ones.",
+        ),
+        (
+            "What causes tides?",
+            "The gravitational pull of the moon and, to a lesser extent, the sun.",
+        ),
     ],
     "cooking": [
-        ("How do I make pasta carbonara?", "Cook guanciale until crispy, whisk eggs with Pecorino, toss with hot pasta."),
-        ("What's a good substitute for buttermilk?", "Milk with a tablespoon of lemon juice or vinegar, rested 5 minutes."),
-        ("How long should I rest steak after cooking?", "About 5-10 minutes, so the juices redistribute."),
+        (
+            "How do I make pasta carbonara?",
+            "Cook guanciale until crispy, whisk eggs with Pecorino, toss with hot pasta.",
+        ),
+        (
+            "What's a good substitute for buttermilk?",
+            "Milk with a tablespoon of lemon juice or vinegar, rested 5 minutes.",
+        ),
+        (
+            "How long should I rest steak after cooking?",
+            "About 5-10 minutes, so the juices redistribute.",
+        ),
     ],
     "history": [
-        ("What are the main causes of the French Revolution?", "Financial crisis, social inequality, and Enlightenment ideas."),
-        ("Who built the Great Wall of China?", "Successive Chinese dynasties, starting as early as the 7th century BC."),
+        (
+            "What are the main causes of the French Revolution?",
+            "Financial crisis, social inequality, and Enlightenment ideas.",
+        ),
+        (
+            "Who built the Great Wall of China?",
+            "Successive Chinese dynasties, starting as early as the 7th century BC.",
+        ),
         ("When did the Berlin Wall fall?", "November 9, 1989."),
     ],
     "literature": [
-        ("Summarize the plot of Hamlet.", "Hamlet, a Danish prince, seeks revenge for his father's murder by his uncle Claudius."),
+        (
+            "Summarize the plot of Hamlet.",
+            "Hamlet, a Danish prince, seeks revenge for his father's murder by his uncle Claudius.",
+        ),
         ("Who wrote Pride and Prejudice?", "Jane Austen, published in 1813."),
         ("What genre is 1984 by George Orwell?", "Dystopian science fiction."),
     ],
     "tech": [
-        ("Explain the difference between TCP and UDP.", "TCP provides reliable, ordered delivery; UDP is faster but has no delivery guarantees."),
-        ("What is a race condition?", "When two threads access shared state without synchronization, causing unpredictable results."),
-        ("What does idempotent mean in an API?", "Calling it multiple times has the same effect as calling it once."),
+        (
+            "Explain the difference between TCP and UDP.",
+            "TCP provides reliable, ordered delivery; UDP is faster but has no delivery guarantees.",
+        ),
+        (
+            "What is a race condition?",
+            "When two threads access shared state without synchronization, causing unpredictable results.",
+        ),
+        (
+            "What does idempotent mean in an API?",
+            "Calling it multiple times has the same effect as calling it once.",
+        ),
     ],
     "math": [
-        ("What is the Pythagorean theorem?", "a² + b² = c², relating the sides of a right triangle."),
+        (
+            "What is the Pythagorean theorem?",
+            "a² + b² = c², relating the sides of a right triangle.",
+        ),
         ("Explain what a derivative measures.", "The instantaneous rate of change of a function."),
-        ("What's the difference between mean and median?", "Mean is the average; median is the middle value when sorted."),
+        (
+            "What's the difference between mean and median?",
+            "Mean is the average; median is the middle value when sorted.",
+        ),
     ],
     "creative": [
-        ("Write a short poem about autumn.", "Golden leaves drift softly down, painting the ground in amber and brown."),
-        ("Give me a one-line story prompt.", "A lighthouse keeper finds a message in a bottle addressed to themselves."),
+        (
+            "Write a short poem about autumn.",
+            "Golden leaves drift softly down, painting the ground in amber and brown.",
+        ),
+        (
+            "Give me a one-line story prompt.",
+            "A lighthouse keeper finds a message in a bottle addressed to themselves.",
+        ),
         ("Suggest a name for a coffee shop.", "Grounded — simple, warm, and on-theme."),
     ],
     "chitchat": [
         ("How's it going?", "Doing well, thanks for asking! How can I help today?"),
-        ("What can you help me with?", "Writing, research, code, planning — pretty much anything text-based."),
+        (
+            "What can you help me with?",
+            "Writing, research, code, planning — pretty much anything text-based.",
+        ),
         ("Thanks, that helped a lot!", "Glad it helped! Let me know if you need anything else."),
     ],
 }
 
 PROMPT_PREFIXES = [
-    "", "", "",  # weight toward no prefix — most real prompts are direct
-    "Quick question: ", "Hey, ", "Can you help me? ", "I need to know: ",
-    "So, ", "Random question — ", "For a project I'm working on: ", "Follow-up: ",
+    "",
+    "",
+    "",  # weight toward no prefix — most real prompts are direct
+    "Quick question: ",
+    "Hey, ",
+    "Can you help me? ",
+    "I need to know: ",
+    "So, ",
+    "Random question — ",
+    "For a project I'm working on: ",
+    "Follow-up: ",
 ]
 
 HARM_PROMPTS = [
@@ -288,7 +350,10 @@ def make_span(harmful: bool, session_id: str) -> tuple[dict, bool]:
                 "timeUnixNano": str(now_ns - 1_000_000),
                 "name": "gen_ai.content.completion",
                 "attributes": [
-                    {"key": "gen_ai.completion", "value": {"stringValue": _completion_json(response_text)}},
+                    {
+                        "key": "gen_ai.completion",
+                        "value": {"stringValue": _completion_json(response_text)},
+                    },
                 ],
             }
         )
@@ -356,8 +421,13 @@ class Stats:
         )
 
 
-async def send_batch(client: httpx.AsyncClient, sem: asyncio.Semaphore, endpoint: str,
-                      spans: list[dict], stats: Stats) -> None:
+async def send_batch(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    endpoint: str,
+    spans: list[dict],
+    stats: Stats,
+) -> None:
     async with sem:
         try:
             resp = await client.post(f"{endpoint}/v1/traces", json=build_payload(spans))
@@ -417,7 +487,9 @@ async def run(args: argparse.Namespace) -> None:
 
     stats = Stats()
     sessions = SessionPool(enabled=not args.no_sessions)
-    limits = httpx.Limits(max_connections=args.concurrency, max_keepalive_connections=args.concurrency)
+    limits = httpx.Limits(
+        max_connections=args.concurrency, max_keepalive_connections=args.concurrency
+    )
     sem = asyncio.Semaphore(args.concurrency)
 
     if args.tick_requests is not None:
@@ -524,27 +596,61 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Simulate LLM OTLP traces at production-like volume and shape",
     )
-    parser.add_argument("--count", type=int, default=1000, help="total spans to send (ignored if --duration is set)")
-    parser.add_argument("--duration", type=float, default=None, help="run for N seconds instead of a fixed count")
-    parser.add_argument("--rps", type=float, default=100, help="target spans/sec, Poisson arrivals (avg over --pattern)")
+    parser.add_argument(
+        "--count", type=int, default=1000, help="total spans to send (ignored if --duration is set)"
+    )
+    parser.add_argument(
+        "--duration", type=float, default=None, help="run for N seconds instead of a fixed count"
+    )
+    parser.add_argument(
+        "--rps",
+        type=float,
+        default=100,
+        help="target spans/sec, Poisson arrivals (avg over --pattern)",
+    )
     parser.add_argument("--concurrency", type=int, default=50, help="max in-flight HTTP requests")
     parser.add_argument("--batch", type=int, default=2, help="spans per OTLP export request")
-    parser.add_argument("--harm-pct", type=float, default=0.2, help="fraction of spans that are harmful (0.0-1.0)")
-    parser.add_argument("--drift-harm", type=parse_drift, default=None, metavar="START:END",
-                         help="linearly ramp harmful fraction from START to END across the run "
-                              "(overrides --harm-pct) — use to exercise PSI/JSD drift detection")
-    parser.add_argument("--pattern", choices=["steady", "diurnal", "bursty"], default="steady",
-                         help="traffic shape over the run: constant, day-cycle wave, or periodic spikes "
-                              "(ignored if --tick-requests is set)")
-    parser.add_argument("--tick-requests", type=parse_int_range, default=None, metavar="MIN:MAX",
-                         help="every --tick-seconds, send a random number of requests in [MIN, MAX] "
-                              "(each --batch spans); runs for --duration seconds. Overrides --rps/--pattern.")
-    parser.add_argument("--tick-seconds", type=float, default=0.5,
-                         help="tick interval in seconds for --tick-requests mode (default: 0.5)")
-    parser.add_argument("--no-sessions", action="store_true",
-                         help="disable multi-turn session grouping (fresh session.id per span)")
+    parser.add_argument(
+        "--harm-pct", type=float, default=0.2, help="fraction of spans that are harmful (0.0-1.0)"
+    )
+    parser.add_argument(
+        "--drift-harm",
+        type=parse_drift,
+        default=None,
+        metavar="START:END",
+        help="linearly ramp harmful fraction from START to END across the run "
+        "(overrides --harm-pct) — use to exercise PSI/JSD drift detection",
+    )
+    parser.add_argument(
+        "--pattern",
+        choices=["steady", "diurnal", "bursty"],
+        default="steady",
+        help="traffic shape over the run: constant, day-cycle wave, or periodic spikes "
+        "(ignored if --tick-requests is set)",
+    )
+    parser.add_argument(
+        "--tick-requests",
+        type=parse_int_range,
+        default=None,
+        metavar="MIN:MAX",
+        help="every --tick-seconds, send a random number of requests in [MIN, MAX] "
+        "(each --batch spans); runs for --duration seconds. Overrides --rps/--pattern.",
+    )
+    parser.add_argument(
+        "--tick-seconds",
+        type=float,
+        default=0.5,
+        help="tick interval in seconds for --tick-requests mode (default: 0.5)",
+    )
+    parser.add_argument(
+        "--no-sessions",
+        action="store_true",
+        help="disable multi-turn session grouping (fresh session.id per span)",
+    )
     parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible runs")
-    parser.add_argument("--endpoint", type=str, default="http://localhost:4318", help="OTel Collector HTTP endpoint")
+    parser.add_argument(
+        "--endpoint", type=str, default="http://localhost:4318", help="OTel Collector HTTP endpoint"
+    )
     args = parser.parse_args()
 
     if args.tick_requests is not None and args.duration is None:
